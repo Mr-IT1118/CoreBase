@@ -7,5 +7,5 @@ A CPU and GPU specifications database project.
 状态
 Early development / 开发初期
 
-合伙人：刘畅，郑淇桂
+合伙人：LABOR-sky & Mono
 
