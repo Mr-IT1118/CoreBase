@@ -1,46 +1,28 @@
-import sqlite3
-from pathlib import Path
+from collector import collect_gpus
+from database import DB_PATH, init_database, save_gpus, get_gpus
 
-# 数据库保存在这个 Python 文件旁边
-db_path = Path(__file__).parent / "hardware.db"
-db = sqlite3.connect(db_path)
 
-# 创建显卡数据表（已存在就跳过）
-db.execute("""
-CREATE TABLE IF NOT EXISTS gpus (
-    product_id TEXT PRIMARY KEY,
-    model TEXT NOT NULL,
-    vram_gb INTEGER,
-    bus_bits INTEGER,
-    source_url TEXT
-)
-""")
+def main():
+    # 1. 准备数据库
+    init_database()
 
-# 模拟 Python 收集到的资料
-# 之后把这里替换成采集程序的输出
-collected_data = [
-    ("demo_001", "示例显卡 A", 16, 256, None),
-    ("demo_002", "示例显卡 B", 8, 128, None)
-]
+    # 2. 获取显卡数据
+    gpus = collect_gpus()
 
-# 批量存入数据库；相同编号再次采集时更新参数
-db.executemany("""
-INSERT INTO gpus
-(product_id, model, vram_gb, bus_bits, source_url)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(product_id) DO UPDATE SET
-    model = excluded.model,
-    vram_gb = excluded.vram_gb,
-    bus_bits = excluded.bus_bits,
-    source_url = excluded.source_url
-""", collected_data)
+    # 3. 保存到数据库
+    save_gpus(gpus)
+    print(f"本次处理了 {len(gpus)} 条显卡数据")
 
-# 保存修改
-db.commit()
+    # 4. 查询并显示
+    for gpu in get_gpus():
+        print(
+            f"{gpu['model']} | "
+            f"显存：{gpu['vram_gb']} GB | "
+            f"位宽：{gpu['bus_bits']} bit"
+        )
 
-# 读取数据，检查是否存入成功
-for row in db.execute("SELECT * FROM gpus"):
-    print(row)
+    print(f"数据库已保存到：{DB_PATH}")
 
-db.close()
-print(f"数据库已保存到：{db_path}")
+
+if __name__ == "__main__":
+    main()
