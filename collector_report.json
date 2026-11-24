@@ -1,0 +1,11 @@
+{
+  "started_at_utc": "2026-11-24T01:19:38.765727+00:00",
+  "brands": {
+    "amd": {
+      "status": "failed",
+      "error": "Could not open https://www.amd.com/en/products/specifications/graphics.html: Page.goto: Timeout 60000ms exceeded.\nCall log:\n  - navigating to \"https://www.amd.com/en/products/specifications/graphics.html\", waiting until \"commit\"\n. Try --show-browser and check that the official page opens in your browser."
+    }
+  },
+  "finished_at_utc": "2026-11-24T01:21:03.696612+00:00",
+  "total_records": 0
+}
