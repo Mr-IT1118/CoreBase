@@ -1,6 +1,6 @@
 """CoreBase official GPU collector. Requires: pip install playwright.
 
-Keeps the existing collect_gpus() interface and five-column SQLite schema.
+Returns the original five input fields consumed by the CoreBase database layer.
 Only complete desktop GPU records are returned. No guessed specifications.
 """
 
@@ -304,21 +304,23 @@ def collect_intel(page):
     return output, skipped
 
 
-def collect_gpus(brands=None, headless=True):
+def collect_gpus(brands=None, headless=True, *, report=None):
     """Called by your existing CoreBase.py. Returns only validated live records."""
-    from playwright.sync_api import sync_playwright
-
     handlers = {"nvidia": collect_nvidia, "amd": collect_amd, "intel": collect_intel}
     selected = list(handlers) if brands is None else list(brands)
     if not selected or any(name not in handlers for name in selected):
         raise ValueError("brands must contain nvidia, amd, and/or intel")
-    report = {"started_at_utc": datetime.now(timezone.utc).isoformat(), "brands": {}}
+    if report is None:
+        report = {}
+    report.update(started_at_utc=datetime.now(timezone.utc).isoformat(), brands={})
+    from playwright.sync_api import sync_playwright
     output = {}
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, args=["--disable-http2"])
         try:
             context = browser.new_context(locale="en-US")
             for brand in selected:
+                started = datetime.now(timezone.utc).isoformat()
                 page = context.new_page()
                 print(f"[CoreBase] Collecting {brand.upper()} ...", flush=True)
                 try:
@@ -340,6 +342,7 @@ def collect_gpus(brands=None, headless=True):
                     report["brands"][brand] = {"status": "failed", "error": str(exc)}
                     LOG.error("[%s] Collection failed: %s", brand, exc)
                 finally:
+                    report["brands"][brand]["started_at"] = started
                     page.close()
         finally:
             browser.close()
@@ -353,6 +356,39 @@ def collect_gpus(brands=None, headless=True):
     return list(output.values())
 
 
+def collect_and_save_gpus(brands=None, headless=True):
+    """Persist the specs and audit result from the same in-memory crawl."""
+    import database
+
+    selected = ["nvidia", "amd", "intel"] if brands is None else list(brands)
+    report = {}
+    try:
+        rows = collect_gpus(selected, headless=headless, report=report)
+    except Exception as exc:
+        if report:
+            for brand in selected:
+                details = report["brands"].get(brand, {})
+                database.record_sync_failure(
+                    "GPU", brand, details.get("error") or str(exc),
+                    details.get("started_at", report["started_at_utc"]), len(details.get("skipped", ())),
+                )
+        raise
+    database.init_database()
+    details_by_brand = report.get("brands", {})
+    if not details_by_brand:
+        database.save_gpus(rows)
+    for brand, details in details_by_brand.items():
+        started = details["started_at"]
+        if details["status"] == "failed":
+            database.record_sync_failure("GPU", brand, details["error"], started)
+            continue
+        selected_rows = [row for row in rows if row["product_id"].split("-", 1)[0] == brand]
+        warnings = details.get("skipped", [])
+        database.save_gpus(selected_rows, brand=brand, started_at=started,
+                           skipped=len(warnings), error_message="\n".join(warnings) or None)
+    return rows
+
+
 def main(argv=None):
     import argparse
 
@@ -363,15 +399,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
-        result = collect_gpus(None if args.brand == "all" else [args.brand], headless=not args.show_browser)
+        run = collect_and_save_gpus if args.save else collect_gpus
+        result = run(None if args.brand == "all" else [args.brand], headless=not args.show_browser)
     except (RuntimeError, ImportError) as exc:
         LOG.error("%s", exc)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if args.save:
-        from database import DB_PATH, init_database, save_gpus
-        init_database()
-        save_gpus(result)
+        from database import DB_PATH
         print(f"[CoreBase] Saved {len(result)} records to {DB_PATH}", flush=True)
     else:
         print("[CoreBase] Preview only. Add --save to write these records to hardware.db.")
