@@ -12,5 +12,5 @@ if errorlevel 1 exit /b 1
 if not exist "build" mkdir "build"
 rc /nologo /fo "build\CoreBase.res" "CoreBase.rc"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /utf-8 /EHsc /Zi /Od /DUNICODE /D_UNICODE /I".vscode" /Fo"build\CoreBaseUI.obj" /Fd"build\compiler.pdb" "CPU&GPU.cpp" /Fe"build\CoreBaseUI.exe" /link "build\CoreBase.res" /DEBUG/SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+cl /nologo /std:c++17 /utf-8 /EHsc /Zi /Od /DUNICODE /D_UNICODE /I".vscode" /Fo"build\CoreBaseUI.obj" /Fd"build\compiler.pdb" "CPU&GPU.cpp" /Fe"build\CoreBaseUI.exe" /link "build\CoreBase.res" /DEBUG /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
 exit /b %errorlevel%

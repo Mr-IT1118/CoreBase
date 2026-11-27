@@ -1,12 +1,7 @@
 ﻿// ============================================================================
 //  CoreBase · CPU & GPU 图鉴
 //  ---------------------------------------------------------------------------
-//  这个版本包含：
-//    1. 原有首页（品牌选择）
-//    2. 参照你给的图片实现的 NVIDIA 显卡库交互页
-//    3. 页面切换、卡片入场、悬停、筛选、搜索、侧栏展开等平滑动画
-//
-//  直接把整个 CPU&GPU.cpp 替换为这份代码即可。
+//  Windows 原生硬件目录与官网采集入口。
 //  注意：源码包含中文，请保存为 UTF-8（带 BOM），否则 VS 可能乱码。
 //  依赖的 IDB_PNG1 / IDB_PNG2 / IDB_PNG3、IDI_CPUGPU 仍然沿用原工程资源。
 // ============================================================================
@@ -27,6 +22,12 @@
 #include <dwmapi.h>
 #include <wincodec.h>
 #include "Resource.h"
+#include "CoreBaseData.h"
+#include "CoreBaseSync.h"
+#include <shellapi.h>
+#include <map>
+#include <thread>
+#pragma comment(lib, "shell32.lib")
 
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
@@ -90,7 +91,6 @@ static const float CARD_H = 232.0f;
 static const float CARD_W = (CONTENT_R - CONTENT_L - CARD_GAP * 2.0f) / 3.0f;
 
 static const float FOOTER_LINE_Y = 774.0f;
-static const float SIDEBAR_ITEM_H = 27.0f;
 static const float SIDEBAR_GROUP_H = 34.0f;
 
 enum class Page
@@ -99,36 +99,19 @@ enum class Page
     Library
 };
 
-struct GpuCard
+struct CatalogCard
 {
-    std::wstring name;
-    std::wstring tag;
-    std::wstring series;
-    int vram = 0;
-    int bus = 0;
-    int power = 0;
-    int variant = 0;
-    D2D1_COLOR_F accent{};
-
-    bool visible = true;
-    float hover = 0.0f;
-    float hoverTarget = 0.0f;
-    float hoverVel = 0.0f;
-    float presence = 1.0f;
-    float presenceTarget = 1.0f;
-    float presenceVel = 0.0f;
-    float x = 0.0f;
-    float y = 0.0f;
-    float tx = 0.0f;
-    float ty = 0.0f;
-    float vx = 0.0f;
-    float vy = 0.0f;
+    const corebase::HardwareItem* item;
+    std::wstring search;
+    std::array<std::pair<std::wstring, std::wstring>, 3> specs;
+    float hover = 0, hoverVel = 0;
 };
 
 struct SideGroup
 {
     std::wstring title;
-    std::vector<std::wstring> items;
+    std::wstring form;
+    std::vector<std::pair<std::wstring, int>> items;
     bool expanded = false;
     float expand = 0.0f;
     float expandTarget = 0.0f;
@@ -192,7 +175,6 @@ static IWICImagingFactory* g_wic = nullptr;
 
 static ID2D1SolidColorBrush* g_solid = nullptr;
 static ID2D1LinearGradientBrush* g_bgGrad = nullptr;
-static ID2D1LinearGradientBrush* g_titleGrad = nullptr;
 static ID2D1LinearGradientBrush* g_homeTitleGrad = nullptr;
 static ID2D1RadialGradientBrush* g_glowPurple = nullptr;
 static ID2D1RadialGradientBrush* g_glowBlue = nullptr;
@@ -245,12 +227,29 @@ static float g_homeHoverTarget[3] = { 0.0f, 0.0f, 0.0f };
 static float g_homeHoverVel[3] = { 0.0f, 0.0f, 0.0f };
 
 // 显卡数据
-static std::vector<GpuCard> g_cards;
+static corebase::HardwareCatalog g_catalog;
+static int g_brand = 0;
+static bool g_cpu = false;
+static std::wstring g_dbError, g_syncStatus, g_seriesForm;
+static std::vector<CatalogCard> g_cards;
+static std::vector<int> g_slots;
 static int g_hoverCard = -1;
-static int g_selectedCard = 0;
+static int g_detail = -1;
+static float g_detailScroll = 0, g_detailMax = 0;
+static bool g_dragGrid = false;
+static float g_dragOffset = 0;
+static float g_gridScroll = 0, g_gridTarget = 0, g_gridVel = 0, g_gridMax = 0;
+static const D2D1_RECT_F gridView{ CONTENT_L - 8, GRID_TOP - 5, CONTENT_R + 8, FOOTER_LINE_Y - 12 };
+static const D2D1_RECT_F gpuTab{742,101,839,143}, cpuTab{843,101,953,143}, syncButton{970,101,1077,143};
+static const D2D1_RECT_F detailPanel{295,72,1305,832}, closeButton{1200,92,1270,130}, sourceButton{1080,770,1270,810};
+static bool g_syncBusy = false, g_closing = false;
+static corebase::detail::Handle g_cancel;
+static std::thread g_worker;
+static corebase::SyncResult g_result;
+static constexpr UINT SyncComplete = WM_APP + 1;
+static D2D1_COLOR_F Accent() { return g_brands[g_brand].accent; }
+static float SideItemHeight() { return g_cpu ? 46.0f : 27.0f; }
 static int g_visibleCount = 0;
-static float g_countShown = 0.0f;
-static float g_countPulse = 0.0f;
 static float g_emptyT = 0.0f;
 static float g_emptyTarget = 0.0f;
 static float g_emptyVel = 0.0f;
@@ -265,7 +264,6 @@ static float g_sideScroll = 0.0f;
 static float g_sideScrollTarget = 0.0f;
 static float g_sideScrollVel = 0.0f;
 static float g_sideScrollMax = 0.0f;
-static bool g_sideScrollToBottom = false;
 static std::wstring g_seriesFilter;
 
 // 搜索 / 筛选
@@ -281,8 +279,9 @@ static bool g_filterOpen = false;
 static float g_filterOpenT = 0.0f;
 static float g_filterOpenVel = 0.0f;
 static int g_filterHover = -1;
-static int g_tagFilter = -1;             // -1 全部，0 旗舰，1 高端，2 中端，3 主流
-static const wchar_t* g_tagNames[4] = { L"旗舰", L"高端", L"中端", L"主流" };
+static int g_formFilter = -1;
+static const wchar_t* forms[] = { L"Desktop", L"Mobile", L"Workstation" };
+static const wchar_t* formLabels[] = { L"桌面端 Desktop", L"移动端 Mobile", L"工作站 Workstation" };
 
 // 顶栏按钮
 static D2D1_RECT_F g_backRect{ 404.0f, 100.0f, 438.0f, 134.0f };
@@ -294,7 +293,6 @@ static float g_filterHoverT = 0.0f;
 static float g_filterHoverVel = 0.0f;
 static float g_emptyHoverVel = 0.0f;
 static float g_sideHoverVel = 0.0f;
-static float g_countVel = 0.0f;
 
 // 这些目标值用于 UpdateHoverTargets 和绘制阶段共享
 static float g_filterHoverTarget = 0.0f;
@@ -307,6 +305,7 @@ static std::wstring g_toastText;
 static D2D1_COLOR_F g_toastColor{};
 static float g_toastTime = 0.0f;
 static bool g_toastVisible = false;
+static const D2D1_RECT_F toastBox{350,720,1250,800};
 
 // ============================================================================
 //  小工具
@@ -344,13 +343,6 @@ static inline float EaseInOutCubic(float t)
 {
     t = Clamp01(t);
     return t < 0.5f ? 4.0f * t * t * t : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) / 2.0f;
-}
-
-static inline float SmoothStep(float a, float b, float x)
-{
-    if (a == b) return x >= b ? 1.0f : 0.0f;
-    float t = Clamp01((x - a) / (b - a));
-    return t * t * (3.0f - 2.0f * t);
 }
 
 static float SmoothDamp(float cur, float target, float& vel, float smoothTime, float dt)
@@ -391,18 +383,12 @@ static std::wstring Lower(std::wstring s)
     return s;
 }
 
-static bool ContainsNoCase(const std::wstring& haystack, const std::wstring& needle)
-{
-    if (needle.empty()) return true;
-    return Lower(haystack).find(Lower(needle)) != std::wstring::npos;
-}
-
 static D2D1_RECT_F CardSlotRect(int slot)
 {
     int col = slot % 3;
     int row = slot / 3;
     float x = CONTENT_L + col * (CARD_W + CARD_GAP);
-    float y = GRID_TOP + row * (CARD_H + CARD_GAP);
+    float y = GRID_TOP + row * (CARD_H + CARD_GAP) - g_gridScroll;
     return D2D1::RectF(x, y, x + CARD_W, y + CARD_H);
 }
 
@@ -423,7 +409,7 @@ static D2D1_RECT_F SearchClearRect()
 
 static D2D1_RECT_F FilterPopupRect()
 {
-    return D2D1::RectF(1320.0f, 152.0f, 1468.0f, 152.0f + 5.0f * 32.0f + 14.0f);
+    return D2D1::RectF(1320.0f, 152.0f, 1468.0f, 152.0f + 4.0f * 32.0f + 14.0f);
 }
 
 static D2D1_RECT_F FilterPopupRowRect(int row)
@@ -435,7 +421,7 @@ static D2D1_RECT_F FilterPopupRowRect(int row)
 
 static float CardEnter(int index)
 {
-    float delay = index * 0.055f;
+    float delay = (index % 3) * 0.055f;
     float t = Clamp01((g_libIntro - delay) / 0.56f);
     return EaseOutCubic(t);
 }
@@ -631,24 +617,6 @@ static void CreateStaticGradients()
 {
     if (!g_rt) return;
 
-    // 标题渐变
-    {
-        D2D1_GRADIENT_STOP stops[] = {
-            { 0.00f, Col(116, 246, 158) },
-            { 0.55f, Col(170, 255, 197) },
-            { 1.00f, Col(220, 255, 232) }
-        };
-        ID2D1GradientStopCollection* collection = nullptr;
-        g_rt->CreateGradientStopCollection(stops, ARRAYSIZE(stops),
-            D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &collection);
-        g_rt->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties(
-                D2D1::Point2F(CONTENT_L, 100.0f),
-                D2D1::Point2F(900.0f, 100.0f)),
-            D2D1::BrushProperties(), collection, &g_titleGrad);
-        if (collection) collection->Release();
-    }
-
     // 首页标题渐变
     {
         D2D1_GRADIENT_STOP stops[] = {
@@ -710,7 +678,6 @@ static void DiscardDeviceResources()
     {
         if (g_logos[i]) { g_logos[i]->Release(); g_logos[i] = nullptr; }
     }
-    if (g_titleGrad) { g_titleGrad->Release(); g_titleGrad = nullptr; }
     if (g_homeTitleGrad) { g_homeTitleGrad->Release(); g_homeTitleGrad = nullptr; }
     if (g_glowPurple) { g_glowPurple->Release(); g_glowPurple = nullptr; }
     if (g_glowBlue) { g_glowBlue->Release(); g_glowBlue = nullptr; }
@@ -896,52 +863,6 @@ static void DrawMiniGpuIcon(float x, float y, float w, float h, D2D1_COLOR_F c)
     Line(x + w * 0.38f, y + h * 0.18f, x + w * 0.62f, y + h * 0.82f, Alpha(c, 0.45f), 0.8f);
 }
 
-static void DrawMemoryIcon(float x, float y, float size, D2D1_COLOR_F c)
-{
-    D2D1_RECT_F chip = D2D1::RectF(x + 1.0f, y + 2.0f, x + size - 1.0f, y + size - 2.0f);
-    StrokeRRect(chip, 1.5f, c, 1.0f);
-    for (int i = 0; i < 3; ++i)
-    {
-        float px = x + 3.0f + i * (size - 6.0f) / 2.0f;
-        Line(px, y, px, y + 2.0f, c, 1.0f);
-        Line(px, y + size - 2.0f, px, y + size, c, 1.0f);
-    }
-}
-
-static void DrawBoltIcon(float x, float y, float size, D2D1_COLOR_F c)
-{
-    SetSolid(c);
-    ID2D1PathGeometry* path = nullptr;
-    ID2D1GeometrySink* sink = nullptr;
-    if (FAILED(g_d2dFactory->CreatePathGeometry(&path))) return;
-    if (FAILED(path->Open(&sink)))
-    {
-        path->Release();
-        return;
-    }
-    sink->BeginFigure(D2D1::Point2F(x + size * 0.58f, y), D2D1_FIGURE_BEGIN_FILLED);
-    sink->AddLine(D2D1::Point2F(x + size * 0.18f, y + size * 0.56f));
-    sink->AddLine(D2D1::Point2F(x + size * 0.47f, y + size * 0.56f));
-    sink->AddLine(D2D1::Point2F(x + size * 0.36f, y + size));
-    sink->AddLine(D2D1::Point2F(x + size * 0.84f, y + size * 0.38f));
-    sink->AddLine(D2D1::Point2F(x + size * 0.54f, y + size * 0.38f));
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    sink->Close();
-    sink->Release();
-    g_rt->FillGeometry(path, g_solid);
-    path->Release();
-}
-
-static void DrawGridIcon(float x, float y, float size, D2D1_COLOR_F c)
-{
-    float s = size * 0.40f;
-    float g = size * 0.18f;
-    FillRRect(x, y, x + s, y + s, 1.2f, c);
-    FillRRect(x + s + g, y, x + size, y + s, 1.2f, c);
-    FillRRect(x, y + s + g, x + s, y + size, 1.2f, c);
-    FillRRect(x + s + g, y + s + g, x + size, y + size, 1.2f, c);
-}
-
 static void DrawFilterIcon(float cx, float cy, float size, D2D1_COLOR_F c)
 {
     Line(cx - size * 0.50f, cy - size * 0.36f, cx + size * 0.50f, cy - size * 0.36f, c, 1.6f);
@@ -959,146 +880,135 @@ static void DrawCheck(float cx, float cy, float size, D2D1_COLOR_F c)
 //  数据初始化
 // ============================================================================
 
+static std::wstring Value(const std::wstring& raw, const std::wstring& unit = {})
+{
+    if (raw.empty()) return L"--";
+    return unit.empty() ? raw : raw + L" " + unit;
+}
+
+using Specs = decltype(CatalogCard::specs);
+static Specs Summary(const corebase::GpuItem& g)
+{
+    return {{ {L"显存", Value(g.vram_gb, L"GB") + L" " + Value(g.vram_type)},
+        {L"位宽", Value(g.bus_bits, L"bit")},
+        g.tdp_w.empty() ? std::make_pair(L"加速频率", Value(g.boost_clock_mhz, L"MHz"))
+                        : std::make_pair(L"TDP", Value(g.tdp_w, L"W")) }};
+}
+static Specs Summary(const corebase::CpuItem& c)
+{
+    return {{ {L"核心 / 线程", Value(c.cores) + L" / " + Value(c.threads)},
+        {L"基础 / 加速频率", Value(c.base_clock_ghz) + L" / " + Value(c.boost_clock_ghz) + L" GHz"},
+        c.l3_cache_mb.empty() ? std::make_pair(L"TDP", Value(c.tdp_w, L"W"))
+                              : std::make_pair(L"L3 缓存", Value(c.l3_cache_mb, L"MB")) }};
+}
+static std::wstring Series(const corebase::HardwareItem& item)
+{
+    return item.series.empty() ? L"其他系列" : item.series;
+}
+static bool ReloadCatalog()
+{
+    bool ok = corebase::LoadCatalogFromDb(g_catalog, g_dbError);
+    for (auto& brand : g_brands)
+    {
+        auto matches = [&](const auto& row) { return row.brand == brand.name; };
+        auto gpu = std::count_if(g_catalog.gpus.begin(), g_catalog.gpus.end(), matches);
+        auto cpu = std::count_if(g_catalog.cpus.begin(), g_catalog.cpus.end(), matches);
+        brand.caption = std::to_wstring(gpu) + L" 款 GPU";
+        if (brand.logo != 0) brand.caption += L" · " + std::to_wstring(cpu) + L" 款 CPU";
+        if (!ok && g_catalog.path.empty()) brand.caption = L"数据库读取失败";
+    }
+    return ok;
+}
 static void InitData()
 {
-    g_brands[0] = { L"NVIDIA", L"从 RIVA 到 RTX 50", 0,
-        Col(96, 239, 142), HomeCardRect(0) };
-    g_brands[1] = { L"AMD", L"Radeon 显卡图鉴", 1,
-        Col(238, 80, 70), HomeCardRect(1) };
-    g_brands[2] = { L"intel", L"Arc 显卡图鉴", 2,
-        Col(75, 146, 245), HomeCardRect(2) };
-
-    g_cards.clear();
-    g_cards.push_back({ L"GeForce RTX 5090", L"旗舰", L"RTX 50", 24, 384, 500, 0,
-        Col(104, 245, 151) });
-    g_cards.push_back({ L"GeForce RTX 5080", L"高端", L"RTX 50", 16, 256, 550, 1,
-        Col(164, 178, 196) });
-    g_cards.push_back({ L"GeForce RTX 5070 Ti", L"中端", L"RTX 50", 12, 192, 220, 2,
-        Col(90, 240, 194) });
-    g_cards.push_back({ L"GeForce RTX 5070", L"中端", L"RTX 50", 12, 192, 200, 3,
-        Col(152, 166, 186) });
-    g_cards.push_back({ L"GeForce RTX 5060 Ti", L"主流", L"RTX 50", 8, 128, 130, 4,
-        Col(137, 226, 169) });
-    g_cards.push_back({ L"GeForce RTX 5060", L"主流", L"RTX 50", 8, 128, 115, 5,
-        Col(154, 191, 175) });
-
-    g_sideGroups.clear();
-    g_sideGroups.push_back({ L"早期系列（RIVA 及以前）",
-        { L"NV1", L"Riva 128", L"RIVA TNT", L"RIVA TNT2" },
-        true, 1.0f, 1.0f, 0.0f });
-    g_sideGroups.push_back({ L"GeForce 游戏系列",
-        { L"GeForce 256", L"GeForce 2", L"GeForce 3", L"GeForce 4",
-          L"FX 5", L"GeForce 6", L"GeForce 7", L"GeForce 8", L"GeForce 9",
-          L"GTX 400", L"GTX 600", L"GTX 700", L"GTX 900", L"GTX 16",
-          L"RTX 20", L"RTX 30", L"RTX 40", L"RTX 50" },
-        true, 1.0f, 1.0f, 0.0f });
-    g_sideGroups.push_back({ L"专业工作站",
-        { L"RTX PRO 6000", L"RTX 5000 Ada", L"RTX 4000 Ada" },
-        false, 0.0f, 0.0f, 0.0f });
-    g_sideGroups.push_back({ L"数据中心",
-        { L"H100 Tensor Core", L"H200 Tensor Core", L"L40S" },
-        false, 0.0f, 0.0f, 0.0f });
-
-    g_visibleCount = (int)g_cards.size();
-    g_countShown = (float)g_visibleCount;
-    g_visibleCount = 0;
-    g_emptyT = 0.0f;
-    g_emptyVel = 0.0f;
+    g_brands[0] = { L"NVIDIA", {}, 0, Col(96,239,142), HomeCardRect(0) };
+    g_brands[1] = { L"AMD", {}, 1, Col(250,122,111), HomeCardRect(1) };
+    g_brands[2] = { L"Intel", {}, 2, Col(104,183,255), HomeCardRect(2) };
+    ReloadCatalog();
 }
-
-// ============================================================================
-//  布局 / 筛选
-// ============================================================================
-
-static bool CardMatches(const GpuCard& card)
-{
-    if (!g_seriesFilter.empty() && card.series != g_seriesFilter)
-        return false;
-
-    if (g_tagFilter >= 0 && g_tagFilter < 4 && card.tag != g_tagNames[g_tagFilter])
-        return false;
-
-    if (!g_searchText.empty())
-    {
-        if (!ContainsNoCase(card.name, g_searchText) &&
-            !ContainsNoCase(card.tag, g_searchText))
-            return false;
-    }
-    return true;
-}
-
-static void SnapCardsToLayout()
-{
-    int slot = 0;
-    for (auto& card : g_cards)
-    {
-        if (card.visible)
-        {
-            D2D1_RECT_F r = CardSlotRect(slot++);
-            card.x = card.tx = r.left;
-            card.y = card.ty = r.top;
-        }
-        card.vx = card.vy = 0.0f;
-        card.hover = card.hoverVel = 0.0f;
-        card.presence = card.visible ? 1.0f : 0.0f;
-        card.presenceVel = 0.0f;
-    }
-    g_hoverCard = -1;
-}
-
 static void ApplyFilters()
 {
-    int count = 0;
-    for (auto& card : g_cards)
+    g_slots.clear();
+    auto needle = Lower(g_searchText);
+    for (int i = 0; i < static_cast<int>(g_cards.size()); ++i)
     {
-        bool visible = CardMatches(card);
-        card.visible = visible;
-        card.presenceTarget = visible ? 1.0f : 0.0f;
-        if (visible) ++count;
+        auto& card = g_cards[i];
+        const auto& item = *card.item;
+        card.hover = card.hoverVel = 0;
+        if (!g_seriesFilter.empty() && (Series(item) != g_seriesFilter || item.form_factor != g_seriesForm)) continue;
+        if (g_formFilter >= 0 && item.form_factor != forms[g_formFilter]) continue;
+        if (card.search.find(needle) != std::wstring::npos) g_slots.push_back(i);
     }
-
-    g_visibleCount = count;
-    g_emptyTarget = (count == 0) ? 1.0f : 0.0f;
-    g_countPulse = 1.0f;
-
-    if (count == 0) g_hoverCard = -1;
+    g_visibleCount = static_cast<int>(g_slots.size());
+    int rows = (g_visibleCount + 2) / 3;
+    g_gridMax = std::max(0.0f, GRID_TOP + rows * (CARD_H + CARD_GAP) - CARD_GAP - gridView.bottom);
+    g_gridScroll = g_gridTarget = g_gridVel = 0;
+    g_emptyTarget = g_slots.empty() ? 1.0f : 0.0f;
+    g_hoverCard = g_detail = -1;
 }
+static void RebuildLibrary()
+{
+    g_cards.clear();
+    g_sideGroups.clear();
+    std::map<std::wstring, std::map<std::wstring,int>> grouped;
+    auto add = [&](const auto& items, const auto& fields) {
+        for (const auto& item : items)
+        {
+            if (item.brand != g_brands[g_brand].name) continue;
+            std::wstring search;
+            auto append = [&](const auto& f) { search += item.*f.member; search += L" "; };
+            for (const auto& f : corebase::commonFields) append(f);
+            for (const auto& f : fields) append(f);
+            g_cards.push_back({&item, Lower(std::move(search)), Summary(item)});
+            ++grouped[item.form_factor][Series(item)];
+        }
+    };
+    if (g_cpu) add(g_catalog.cpus, corebase::cpuFields);
+    else add(g_catalog.gpus, corebase::gpuFields);
 
+    for (int i = 0; i < 3; ++i)
+    {
+        auto group = grouped.find(forms[i]);
+        if (group == grouped.end()) continue;
+        SideGroup side;
+        side.title = formLabels[i];
+        side.form = forms[i];
+        side.items.assign(group->second.begin(), group->second.end());
+        side.expanded = true;
+        side.expand = side.expandTarget = 1;
+        g_sideGroups.push_back(std::move(side));
+    }
+    g_syncStatus = L"暂无同步记录";
+    for (const auto& log : g_catalog.logs)
+    {
+        if (log.brand != g_brands[g_brand].name || log.category != (g_cpu ? L"CPU" : L"GPU")) continue;
+        auto time = log.finished_at.substr(0,16);
+        std::replace(time.begin(), time.end(), L'T', L' ');
+        g_syncStatus = L"最近同步  " + time + L" UTC  ·  "
+            + (log.status == L"success" ? L"成功" : log.status == L"partial" ? L"部分完成" : L"失败");
+    }
+    if (g_catalog.immutable) g_syncStatus += L"  ·  只读主库快照";
+    if (!g_dbError.empty()) g_syncStatus = L"读取失败  " + g_dbError;
+    ApplyFilters();
+}
 static void ResetLibraryState()
 {
     g_searchText.clear();
-    g_searchFocused = false;
-    g_searchFocusT = 0.0f;
-    g_searchFocusVel = 0.0f;
-    g_filterOpen = false;
-    g_filterOpenT = 0.0f;
-    g_filterOpenVel = 0.0f;
-    g_filterHover = -1;
-    g_tagFilter = -1;
+    g_searchFocused = g_filterOpen = false;
+    g_searchFocusT = g_searchFocusVel = g_filterOpenT = g_filterOpenVel = 0;
+    g_formFilter = -1;
     g_seriesFilter.clear();
-    g_sideScroll = 0.0f;
-    g_sideScrollTarget = 0.0f;
-    g_sideScrollVel = 0.0f;
-    g_sideScrollToBottom = false;
-    g_sideHoverRow = -1;
-    g_sideHoverT = 0.0f;
-    g_selectedCard = 0;
-    g_emptyT = 0.0f;
-    g_emptyVel = 0.0f;
-
-    ApplyFilters();
-    int slot = 0;
-    for (auto& card : g_cards)
-    {
-        D2D1_RECT_F r = CardSlotRect(slot++);
-        card.x = card.tx = r.left;
-        card.y = card.ty = r.top;
-        card.presence = 1.0f;
-        card.presenceTarget = 1.0f;
-        card.presenceVel = 0.0f;
-    }
-    g_countShown = (float)g_visibleCount;
-    SnapCardsToLayout();
+    g_sideScroll = g_sideScrollTarget = g_sideScrollVel = 0;
+    RebuildLibrary();
+}
+static int FirstSlot() { return std::max(0, (static_cast<int>(g_gridScroll / (CARD_H + CARD_GAP)) - 1) * 3); }
+static int EndSlot() { return std::min(g_visibleCount, FirstSlot() + 18); }
+static int CardAt(D2D1_POINT_2F p)
+{
+    if (InRect(gridView, p))
+        for (int slot = FirstSlot(); slot < EndSlot(); ++slot)
+            if (InRect(CardSlotRect(slot), p)) return g_slots[slot];
+    return -1;
 }
 
 // ============================================================================
@@ -1175,8 +1085,6 @@ static void UpdateHoverTargets()
     g_emptyHoverTarget = 0.0f;
     g_handCursor = false;
 
-    for (auto& card : g_cards)
-        card.hoverTarget = 0.0f;
 
     if (g_navActive || !g_mouseInside)
         return;
@@ -1195,11 +1103,16 @@ static void UpdateHoverTargets()
         return;
     }
 
+    if (g_detail >= 0)
+    {
+        g_handCursor = InRect(closeButton, g_mouse) || (g_cards[g_detail].item->source_url.rfind(L"https://",0) == 0 && InRect(sourceButton, g_mouse));
+        return;
+    }
     if (g_filterOpen)
     {
         if (InRect(FilterPopupRect(), g_mouse))
         {
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < 4; ++i)
             {
                 if (InRect(FilterPopupRowRect(i), g_mouse))
                 {
@@ -1220,7 +1133,7 @@ static void UpdateHoverTargets()
     if (InRect(g_filterRect, g_mouse)) g_filterHoverTarget = 1.0f;
     if (!g_searchText.empty() && InRect(SearchClearRect(), g_mouse))
         g_clearHoverTarget = 1.0f;
-    if (g_visibleCount == 0 && InRect(g_emptyResetRect, g_mouse))
+    if (!g_cards.empty() && g_visibleCount == 0 && InRect(g_emptyResetRect, g_mouse))
         g_emptyHoverTarget = 1.0f;
 
     if (InRect(D2D1::RectF(PANEL_L, SIDE_TOP, SIDEBAR_R, SIDE_BOTTOM), g_mouse))
@@ -1236,24 +1149,14 @@ static void UpdateHoverTargets()
         }
     }
 
-    for (int i = 0; i < (int)g_cards.size(); ++i)
-    {
-        const auto& card = g_cards[i];
-        if (!card.visible || card.presence < 0.4f) continue;
-        D2D1_RECT_F r = D2D1::RectF(card.x, card.y, card.x + CARD_W, card.y + CARD_H);
-        if (InRect(r, g_mouse)) { g_hoverCard = i; break; }
-    }
-
-    for (int i = 0; i < (int)g_cards.size(); ++i)
-        g_cards[i].hoverTarget = (i == g_hoverCard) ? 1.0f : 0.0f;
-
+    g_hoverCard = CardAt(g_mouse);
     g_handCursor =
-        (g_homeHover >= 0) ||
+        InRect(gpuTab,g_mouse) || (g_brand != 0 && InRect(cpuTab,g_mouse)) || (!g_syncBusy && InRect(syncButton,g_mouse)) ||
         InRect(g_backRect, g_mouse) || InRect(g_searchRect, g_mouse) ||
         InRect(g_filterRect, g_mouse) ||
         (!g_searchText.empty() && InRect(SearchClearRect(), g_mouse)) ||
         g_sideHoverRow >= 0 || g_hoverCard >= 0 ||
-        (g_visibleCount == 0 && InRect(g_emptyResetRect, g_mouse));
+        (!g_cards.empty() && g_visibleCount == 0 && InRect(g_emptyResetRect, g_mouse));
 }
 
 static void BuildSideRows(std::vector<SideRow>& rows, float& contentHeight)
@@ -1267,14 +1170,14 @@ static void BuildSideRows(std::vector<SideRow>& rows, float& contentHeight)
         rows.push_back({ gi, -1, true, D2D1::RectF(PANEL_L + 16.0f, y, SIDEBAR_R - 14.0f, y + SIDEBAR_GROUP_H) });
         y += SIDEBAR_GROUP_H;
 
-        float itemsH = group.items.size() * SIDEBAR_ITEM_H * group.expand;
+        float itemsH = static_cast<float>(group.items.size()) * SideItemHeight() * group.expand;
         if (itemsH > 0.4f)
         {
             float clipBottom = y + itemsH;
             for (int ii = 0; ii < (int)group.items.size(); ++ii)
             {
-                float top = y + ii * SIDEBAR_ITEM_H;
-                float bottom = top + SIDEBAR_ITEM_H;
+                float top = y + ii * SideItemHeight();
+                float bottom = top + SideItemHeight();
                 if (top + 1.0f >= clipBottom) break;
                 rows.push_back({ gi, ii, false,
                     D2D1::RectF(PANEL_L + 28.0f, top, SIDEBAR_R - 14.0f, bottom) });
@@ -1284,25 +1187,6 @@ static void BuildSideRows(std::vector<SideRow>& rows, float& contentHeight)
     }
 
     contentHeight = (y + g_sideScroll) - SIDE_TOP;
-}
-
-static void UpdateCardTargets()
-{
-    int slot = 0;
-    for (auto& card : g_cards)
-    {
-        if (card.visible)
-        {
-            D2D1_RECT_F r = CardSlotRect(slot++);
-            card.tx = r.left;
-            card.ty = r.top;
-        }
-        else
-        {
-            card.tx = card.x;
-            card.ty = card.y;
-        }
-    }
 }
 
 static void UpdateAnimation(float dt)
@@ -1364,8 +1248,6 @@ static void UpdateAnimation(float dt)
     }
     float viewportH = SIDE_BOTTOM - SIDE_TOP;
     g_sideScrollMax = std::max(0.0f, contentH - viewportH);
-    if (g_sideScrollToBottom)
-        g_sideScrollTarget = g_sideScrollMax;
     g_sideScrollTarget = std::max(0.0f, std::min(g_sideScrollTarget, g_sideScrollMax));
     g_sideScroll = SmoothDamp(g_sideScroll, g_sideScrollTarget, g_sideScrollVel, 0.12f, dt);
     g_sideScroll = std::max(0.0f, std::min(g_sideScroll, g_sideScrollMax));
@@ -1373,20 +1255,17 @@ static void UpdateAnimation(float dt)
     g_sideHoverT = SmoothDamp(g_sideHoverT, (g_sideHoverRow >= 0) ? 1.0f : 0.0f,
         g_sideHoverVel, 0.08f, dt);
 
-    // 卡片布局
-    UpdateCardTargets();
-    for (auto& card : g_cards)
+    g_gridScroll = SmoothDamp(g_gridScroll, g_gridTarget, g_gridVel, 0.10f, dt);
+    if (std::abs(g_gridScroll - g_gridTarget) < 0.05f) { g_gridScroll = g_gridTarget; g_gridVel = 0; }
+    g_hoverCard = (g_page == Page::Library && !g_navActive && !g_filterOpen && g_detail < 0) ? CardAt(g_mouse) : -1;
+    for (int slot = FirstSlot(); slot < EndSlot(); ++slot)
     {
-        card.hover = SmoothDamp(card.hover, card.hoverTarget, card.hoverVel, 0.10f, dt);
-        card.presence = SmoothDamp(card.presence, card.presenceTarget,
-            card.presenceVel, 0.14f, dt);
-        card.x = SmoothDamp(card.x, card.tx, card.vx, 0.15f, dt);
-        card.y = SmoothDamp(card.y, card.ty, card.vy, 0.15f, dt);
+        auto index = g_slots[slot];
+        auto& card = g_cards[index];
+        card.hover = SmoothDamp(card.hover, index == g_hoverCard ? 1.0f : 0.0f, card.hoverVel, 0.09f, dt);
     }
 
     // 计数 / 空状态
-    g_countShown = SmoothDamp(g_countShown, (float)g_visibleCount, g_countVel, 0.20f, dt);
-    g_countPulse = std::max(0.0f, g_countPulse - dt * 2.6f);
     g_emptyT = SmoothDamp(g_emptyT, g_emptyTarget, g_emptyVel, 0.18f, dt);
 
     if (g_hoverCard >= 0)
@@ -1398,7 +1277,7 @@ static void UpdateAnimation(float dt)
     if (g_toastVisible)
     {
         g_toastTime += dt;
-        if (g_toastTime > 2.65f)
+        if (g_toastTime > 7.0f)
         {
             g_toastVisible = false;
             g_toastTime = 0.0f;
@@ -1423,21 +1302,15 @@ static bool NeedsContinuousFrames()
     if (!Nearly(g_filterOpenT, g_filterOpen ? 1.0f : 0.0f, 0.004f)) return true;
     if (!Nearly(g_searchFocusT, g_searchFocused ? 1.0f : 0.0f, 0.004f)) return true;
     if (!Nearly(g_sideScroll, g_sideScrollTarget, 0.05f)) return true;
-    if (!Nearly(g_countShown, (float)g_visibleCount, 0.02f)) return true;
     if (!Nearly(g_emptyT, g_emptyTarget, 0.004f)) return true;
-    if (g_countPulse > 0.005f) return true;
 
     for (int i = 0; i < 3; ++i)
     {
         if (!Nearly(g_homeHoverV[i], g_homeHoverTarget[i], 0.004f)) return true;
     }
-    for (auto& card : g_cards)
-    {
-        if (!Nearly(card.hover, card.hoverTarget, 0.004f)) return true;
-        if (!Nearly(card.presence, card.presenceTarget, 0.004f)) return true;
-        if (!Nearly(card.x, card.tx, 0.05f) || !Nearly(card.y, card.ty, 0.05f)) return true;
-        if (card.hover > 0.02f && card.visible) return true;
-    }
+    if (!Nearly(g_gridScroll, g_gridTarget, 0.05f) || g_hoverCard >= 0) return true;
+    for (int slot = FirstSlot(); slot < EndSlot(); ++slot)
+        if (g_cards[g_slots[slot]].hover > 0.004f) return true;
 
     if (!Nearly(g_sideHoverT, (g_sideHoverRow >= 0) ? 1.0f : 0.0f, 0.004f)) return true;
     float backTarget = (!g_navActive && g_page == Page::Library && InRect(g_backRect, g_mouse)) ? 1.0f : 0.0f;
@@ -1606,9 +1479,7 @@ static void DrawHomeCard(int i)
 
     // 底部入口
     D2D1_COLOR_F arrowColor = Alpha(brand.accent, 0.70f + hover * 0.30f);
-    const wchar_t* actionText = (i == 0)
-        ? (hover > 0.35f ? L"进入图鉴  →" : L"浏览系列  →")
-        : (hover > 0.35f ? L"即将上线  →" : L"敬请期待");
+    const wchar_t* actionText = L"浏览图鉴  →";
     Text(actionText, g_fonts.homeFooter,
         D2D1::RectF(base.left, base.top + 260.0f, base.right, base.top + 282.0f),
         arrowColor, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1782,6 +1653,14 @@ static void DrawBackButton()
     Line(cx - 3.0f, cy, cx + 4.0f, cy + 6.0f, c, 1.8f);
 }
 
+static void Wrapped(const std::wstring& s, IDWriteTextFormat* font, D2D1_RECT_F rect, D2D1_COLOR_F color)
+{
+    font->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    font->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    font->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    SetSolid(color);
+    g_rt->DrawText(s.data(), static_cast<UINT32>(s.size()), font, rect, g_solid, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
 static void DrawSidebar()
 {
     std::vector<SideRow> rows;
@@ -1821,16 +1700,16 @@ static void DrawSidebar()
         else
         {
             auto& group = g_sideGroups[row.group];
-            const std::wstring& item = group.items[row.item];
-            bool selected = (g_seriesFilter == item);
+            const auto& item = group.items[row.item].first;
+            bool selected = (g_seriesFilter == item && g_seriesForm == group.form);
 
             if (selected)
             {
                 FillRRect(D2D1::RectF(row.rect.left - 1.0f, row.rect.top + 1.0f,
-                    row.rect.right, row.rect.bottom - 1.0f), 7.0f, Col(96, 239, 142, 16));
+                    row.rect.right, row.rect.bottom - 1.0f), 7.0f, Alpha(Accent(),0.08f));
                 FillRRect(row.rect.left - 1.0f, row.rect.top + 7.0f,
                     row.rect.left + 1.0f, row.rect.bottom - 7.0f, 1.0f,
-                    Col(110, 245, 157, 220));
+                    Accent());
             }
             else if (hovered)
             {
@@ -1840,19 +1719,19 @@ static void DrawSidebar()
             }
 
             D2D1_COLOR_F itemColor = selected
-                ? Col(124, 243, 165)
+                ? Accent()
                 : (hovered ? Col(224, 233, 248) : Col(190, 201, 219));
             D2D1_COLOR_F iconColor = selected
-                ? Col(109, 239, 153, 230)
+                ? Accent()
                 : Col(110, 143, 167, hovered ? 220 : 160);
 
             DrawMiniGpuIcon(row.rect.left + 19.0f, row.rect.top + 8.0f, 15.0f, 10.0f, iconColor);
-            Text(item, g_fonts.sideItem,
+            Wrapped(item, g_fonts.sideItem,
                 D2D1::RectF(row.rect.left + 43.0f, row.rect.top + 4.0f,
-                    row.rect.right - 28.0f, row.rect.bottom - 3.0f),
+                    row.rect.right - 41.0f, row.rect.bottom - 3.0f),
                 itemColor);
-            DrawChevron(row.rect.right - 18.0f, row.rect.top + SIDEBAR_ITEM_H * 0.5f,
-                7.0f, 0.0f, Col(101, 112, 135, 180), 1.1f);
+            Text(std::to_wstring(group.items[row.item].second), g_fonts.tag,
+                {row.rect.right - 39, row.rect.top + 4, row.rect.right - 4, row.rect.bottom}, Accent(), DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
     }
 
@@ -1873,25 +1752,24 @@ static void DrawSidebar()
     }
 }
 
+static void Button(D2D1_RECT_F rect, const std::wstring& label, bool active = false, bool disabled = false)
+{
+    auto ink = disabled ? Col(107,116,136) : active ? Accent() : Col(211,222,237);
+    FillRRect(rect, 9, active ? Alpha(Accent(),0.13f) : Col(26,32,48));
+    StrokeRRect(rect, 9, active ? Alpha(Accent(),0.5f) : Col(51,61,80), 1);
+    Text(label, g_fonts.search, rect, ink, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+}
 static void DrawHeader()
 {
     DrawBackButton();
-
-    if (g_titleGrad)
-    {
-        TextBrush(L"NVIDIA 显卡库", g_fonts.h1,
-            D2D1::RectF(CONTENT_L, 86.0f, CONTENT_R - 280.0f, 142.0f), g_titleGrad);
-    }
-    else
-    {
-        Text(L"NVIDIA 显卡库", g_fonts.h1,
-            D2D1::RectF(CONTENT_L, 86.0f, CONTENT_R - 280.0f, 142.0f),
-            Col(135, 247, 169));
-    }
-
-    Text(L"探索 NVIDIA 显卡的精彩历程与技术规格", g_fonts.subtitle,
-        D2D1::RectF(CONTENT_L + 1.0f, 146.0f, 1000.0f, 168.0f),
-        Col(138, 147, 168));
+    auto& brand = g_brands[g_brand];
+    Text(brand.name + (g_cpu ? L" 处理器库" : L" 显卡库"), g_fonts.h1,
+        {CONTENT_L,86,742,145}, Accent());
+    Text(brand.name + (g_cpu ? L"  /  CPU" : L"  /  GPU") + L"     " + g_syncStatus,
+        g_fonts.subtitle, {CONTENT_L,151,CONTENT_R,180}, Col(159,170,191));
+    Button(gpuTab, L"显卡 GPU", !g_cpu);
+    Button(cpuTab, L"处理器 CPU", g_cpu, g_brand == 0);
+    Button(syncButton, g_syncBusy ? L"正在同步…" : L"同步数据", false, g_syncBusy);
 
     // ===== 搜索框 =====
     float focus = g_searchFocusT;
@@ -1922,7 +1800,7 @@ static void DrawHeader()
     const float textW = 192.0f;
     if (g_searchText.empty())
     {
-        Text(L"搜索显卡型号...", g_fonts.search,
+        Text(L"搜索型号、系列或规格…", g_fonts.search,
             D2D1::RectF(textX, 107.0f, textX + textW, 139.0f),
             Col(102, 112, 134), DWRITE_TEXT_ALIGNMENT_LEADING,
             DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1948,7 +1826,7 @@ static void DrawHeader()
                 layout->GetMetrics(&metrics);
                 float caretX = textX + std::min(metrics.widthIncludingTrailingWhitespace, textW);
                 Line(caretX + 1.0f, 111.0f, caretX + 1.0f, 133.0f,
-                    Col(118, 242, 163), 1.4f);
+                    Accent(), 1.4f);
             }
             layout->Release();
         }
@@ -1983,9 +1861,9 @@ static void DrawHeader()
         Col(206, 216, 233), DWRITE_TEXT_ALIGNMENT_CENTER,
         DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    if (g_tagFilter >= 0)
+    if (g_formFilter >= 0)
     {
-        Circle(g_filterRect.right - 8.0f, g_filterRect.top + 8.0f, 2.6f, Col(109, 244, 158));
+        Circle(g_filterRect.right - 8.0f, g_filterRect.top + 8.0f, 2.6f, Accent());
     }
 }
 
@@ -1993,7 +1871,7 @@ static void DrawHeader()
 //  显卡卡片
 // ============================================================================
 
-static void DrawGpuArt(const D2D1_RECT_F& box, const GpuCard& card, float hover, float active)
+static void DrawGpuArt(const D2D1_RECT_F& box, D2D1_COLOR_F accent, float hover, float active)
 {
     float w = box.right - box.left;
     float h = box.bottom - box.top;
@@ -2012,7 +1890,6 @@ static void DrawGpuArt(const D2D1_RECT_F& box, const GpuCard& card, float hover,
 
     g_rt->SetTransform(artT * saved);
 
-    D2D1_COLOR_F accent = card.accent;
 
     // 地面阴影
     g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(0.0f, 45.0f), 86.0f, 9.0f),
@@ -2091,146 +1968,134 @@ static void DrawGpuArt(const D2D1_RECT_F& box, const GpuCard& card, float hover,
     g_rt->SetTransform(saved);
 }
 
-static void DrawGpuCard(int index)
+static void DrawCpuArt(float x, float y, D2D1_COLOR_F color)
 {
-    GpuCard& card = g_cards[index];
-    float enter = CardEnter(index);
-    float alpha = EaseOutCubic(Clamp01(card.presence)) * enter;
-    if (alpha <= 0.004f) return;
-
-    D2D1_RECT_F base = D2D1::RectF(card.x, card.y, card.x + CARD_W, card.y + CARD_H);
-    float hover = card.hover;
-    bool selected = (index == g_selectedCard);
-
-    D2D1_MATRIX_3X2_F saved{};
-    g_rt->GetTransform(&saved);
-
-    float cx = (base.left + base.right) * 0.5f;
-    float cy = (base.top + base.bottom) * 0.5f;
-    float scale = 1.0f + hover * 0.010f;
-    D2D1::Matrix3x2F cardT =
-        D2D1::Matrix3x2F::Translation(0.0f, (1.0f - enter) * 24.0f) *
-        D2D1::Matrix3x2F::Translation(cx, cy) *
-        D2D1::Matrix3x2F::Scale(scale, scale) *
-        D2D1::Matrix3x2F::Translation(-cx, -cy) *
-        D2D1::Matrix3x2F::Translation(0.0f, -5.0f * hover);
-    g_rt->SetTransform(cardT * saved);
-
-    bool useLayer = alpha < 0.999f;
-    if (useLayer) PushLayer(alpha);
-
-    D2D1_COLOR_F accent = card.accent;
-    float active = std::max(hover, selected ? 1.0f : 0.0f);
-
-    // 阴影
-    FillRRect(base.left + 2.0f, base.top + 10.0f, base.right - 2.0f, base.bottom + 12.0f,
-        17.0f, Col(0, 0, 0, 80));
-    FillRRect(base.left + 8.0f, base.top + 20.0f, base.right - 8.0f, base.bottom + 18.0f,
-        15.0f, Col(0, 0, 0, 36));
-
-    // 卡面
-    FillRRect(base, 16.0f, Col(16, 20, 33, 242));
-    FillRRect(base.left + 1.0f, base.top + 1.0f, base.right - 1.0f, base.top + 90.0f,
-        15.0f, Col(37, 45, 66, 25));
-
-    if (selected || hover > 0.01f)
+    for (int i = -3; i <= 3; ++i)
     {
-        // 选中 / 悬停时叠一层非常淡的绿色
-        FillRRect(base, 16.0f, Alpha(accent, 0.018f * active));
-        if (g_glowGreen)
+        float offset = i * 7.0f;
+        Line(x+offset,y-32,x+offset,y-40,color,2);
+        Line(x+offset,y+32,x+offset,y+40,color,2);
+        Line(x-32,y+offset,x-40,y+offset,color,2);
+        Line(x+32,y+offset,x+40,y+offset,color,2);
+    }
+    FillRRect(x-32,y-32,x+32,y+32,6,Col(32,43,57));
+    StrokeRRect(x-32,y-32,x+32,y+32,6,Alpha(color,0.7f),1.5f);
+    FillRRect(x-22,y-22,x+22,y+22,4,Alpha(color,0.16f));
+    Text(L"CPU",g_fonts.footerBold,{x-22,y-20,x+22,y+20},color,
+        DWRITE_TEXT_ALIGNMENT_CENTER,DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+}
+
+static void DrawCard(int slot)
+{
+    const auto& card = g_cards[g_slots[slot]];
+    auto box = CardSlotRect(slot);
+    auto accent = Accent();
+    float enter = CardEnter(slot), x = box.left, y = box.top;
+    if (enter < 1) PushLayer(enter);
+    FillRRect(box, 14, Col(22,28,43));
+    StrokeRRect(box, 14, card.hover > 0.01f ? Alpha(accent,0.25f + 0.65f * card.hover) : Col(51,61,81), 1.2f);
+    Text(card.item->form_factor, g_fonts.tag, {x+18,y+12,box.right-18,y+32}, accent);
+    Wrapped(card.item->model, g_fonts.specValue, {x+18,y+38,box.right-16,y+90}, Col(241,246,254));
+
+    if (g_cpu) DrawCpuArt(x+68,y+154,accent);
+    else DrawGpuArt({x+8,y+106,x+132,y+198},accent,card.hover,card.hover);
+    for (int i = 0; i < 3; ++i)
+    {
+        float top = y + 88 + 44.0f * i;
+        Text(card.specs[i].first, g_fonts.specLabel, {x+142,top,box.right-7,top+18},Col(156,168,191));
+        Text(card.specs[i].second, g_fonts.specValue, {x+142,top+15,box.right-6,top+42},Col(231,239,250));
+    }
+    if (enter < 1) PopLayer();
+}
+
+struct DetailRow
+{
+    std::wstring label, value;
+    float top, height;
+};
+static std::vector<DetailRow> g_detailRows;
+static constexpr float detailTop = 167, detailBottom = 749, valueLeft = 526, valueRight = 1260;
+static void OpenDetail(int index)
+{
+    g_detail = index;
+    g_detailScroll = 0;
+    g_detailRows.clear();
+    float top = 0;
+    auto& item = *g_cards[index].item;
+    auto append = [&](const auto& row, const auto& field) {
+        auto value = Value(row.*field.member, field.unit);
+        auto font = g_fonts.search;
+        font->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        IDWriteTextLayout* layout = nullptr;
+        float height = 35;
+        if (SUCCEEDED(g_dwrite->CreateTextLayout(value.data(), static_cast<UINT32>(value.size()),
+            font, valueRight-valueLeft, 20000, &layout)))
         {
-            g_glowGreen->SetOpacity(0.075f * active);
-            g_glowGreen->SetTransform(D2D1::Matrix3x2F::Scale(CARD_W * 0.55f, 160.0f) *
-                D2D1::Matrix3x2F::Translation(cx, base.top + 94.0f));
-            g_rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, base.top + 94.0f),
-                CARD_W * 0.55f, 160.0f), g_glowGreen);
-            g_glowGreen->SetTransform(D2D1::Matrix3x2F::Identity());
-            g_glowGreen->SetOpacity(1.0f);
+            DWRITE_TEXT_METRICS metrics{};
+            layout->GetMetrics(&metrics);
+            height = std::max(height, metrics.height + 14);
+            layout->Release();
         }
-    }
-
-    g_rt->PushAxisAlignedClip(D2D1::RectF(base.left + 1.0f, base.top + 1.0f,
-        base.right - 1.0f, base.bottom - 1.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-
-    // 标题
-    Text(card.name, g_fonts.cardTitle,
-        D2D1::RectF(base.left + 20.0f, base.top + 16.0f,
-            base.right - 16.0f, base.top + 46.0f),
-        Col(244, 247, 255));
-
-    // 标签
-    std::wstring tag = card.tag;
-    float tagW = 46.0f;
-    D2D1_RECT_F tagRect = D2D1::RectF(base.left + 21.0f, base.top + 51.0f,
-        base.left + 21.0f + tagW, base.top + 73.0f);
-    FillRRect(tagRect, 4.5f, Alpha(accent, 0.12f + active * 0.06f));
-    StrokeRRect(tagRect, 4.5f, Alpha(accent, 0.26f + active * 0.20f), 0.8f);
-    Text(tag, g_fonts.tag,
-        D2D1::RectF(tagRect.left + 6.0f, tagRect.top + 3.0f,
-            tagRect.right - 4.0f, tagRect.bottom - 2.0f),
-        Alpha(accent, 0.95f));
-
-    // 显卡图形
-    DrawGpuArt(D2D1::RectF(base.left + 15.0f, base.top + 78.0f,
-        base.left + 212.0f, base.top + 195.0f), card, hover, active);
-
-    // 规格
-    float sx = base.left + 228.0f;
-    float sy = base.top + 78.0f;
-    D2D1_COLOR_F labelColor = Col(143, 154, 177);
-    D2D1_COLOR_F valueColor = Col(231, 237, 247);
-
-    const wchar_t* labels[3] = { L"显存", L"位宽", L"功耗" };
-    std::wstring values[3] = {
-        std::to_wstring(card.vram) + L" GB",
-        std::to_wstring(card.bus) + L" bit",
-        std::to_wstring(card.power) + L" W"
+        g_detailRows.push_back({field.label,std::move(value),top,height});
+        top += height;
     };
-
-    for (int row = 0; row < 3; ++row)
+    if (g_cpu)
+        for (auto& f : corebase::cpuFields) append(static_cast<const corebase::CpuItem&>(item), f);
+    else
+        for (auto& f : corebase::gpuFields) append(static_cast<const corebase::GpuItem&>(item), f);
+    for (auto& f : corebase::commonFields) append(item, f);
+    g_detailMax = std::max(0.0f, top - (detailBottom-detailTop));
+}
+static bool HasSource()
+{
+    return g_detail >= 0 && g_cards[g_detail].item->source_url.rfind(L"https://",0) == 0;
+}
+static float ThumbHeight(float height, float maxOffset)
+{
+    return std::max(28.0f,height*height/(height+maxOffset));
+}
+static float GridThumbTop()
+{
+    float height = gridView.bottom-gridView.top;
+    return gridView.top + (height-ThumbHeight(height,g_gridMax))*g_gridScroll/g_gridMax;
+}
+static void DragGrid(float y)
+{
+    float height = gridView.bottom-gridView.top;
+    float travel = height-ThumbHeight(height,g_gridMax);
+    g_gridScroll = g_gridTarget = g_gridMax * Clamp01((y-gridView.top-g_dragOffset)/travel);
+    g_gridVel = 0;
+}
+static void Scrollbar(float x, float top, float bottom, float offset, float maxOffset)
+{
+    if (maxOffset <= 0) return;
+    float h = bottom-top;
+    float thumb = ThumbHeight(h,maxOffset);
+    float y = top + (h-thumb)*offset/maxOffset;
+    FillRRect(x,top,x+4,bottom,2,Col(49,57,73));
+    FillRRect(x,y,x+4,y+thumb,2,Alpha(Accent(),0.7f));
+}
+static void DrawDetail()
+{
+    FillRect({0,0,DESIGN_W,DESIGN_H}, Col(2,5,11,183));
+    FillRRect(detailPanel,18,Col(21,28,43,250));
+    StrokeRRect(detailPanel,18,Alpha(Accent(),0.5f),1);
+    Text(g_brands[g_brand].name + (g_cpu ? L"  /  CPU 参数" : L"  /  GPU 参数"),g_fonts.tag,{325,90,1180,112},Accent());
+    Wrapped(g_cards[g_detail].item->model,g_fonts.cardTitle,{325,113,1180,166},Col(239,244,252));
+    Button(closeButton,L"关闭 ×");
+    g_rt->PushAxisAlignedClip({320,detailTop,1280,detailBottom},D2D1_ANTIALIAS_MODE_ALIASED);
+    for (const auto& row : g_detailRows)
     {
-        const float rowY = sy + row * 38.0f;
-        Text(labels[row], g_fonts.specLabel,
-            D2D1::RectF(sx + 20.0f, rowY, sx + 94.0f, rowY + 15.0f), labelColor);
-
-        if (row == 0)
-            DrawMemoryIcon(sx, rowY + 13.0f, 12.0f, Col(111, 239, 154, 225));
-        else if (row == 2)
-            DrawBoltIcon(sx + 1.0f, rowY + 13.0f, 11.0f, Col(111, 239, 154, 225));
-
-        Text(values[row], g_fonts.specValue,
-            D2D1::RectF(sx + 20.0f, rowY + 9.0f, sx + 94.0f, rowY + 30.0f),
-            valueColor);
+        float y = detailTop + row.top - g_detailScroll;
+        if (y + row.height <= detailTop || y >= detailBottom) continue;
+        Text(row.label,g_fonts.search,{325,y+6,valueLeft-15,y+row.height},Col(153,167,190));
+        Wrapped(row.value,g_fonts.search,{valueLeft,y+6,valueRight,y+row.height},Col(231,238,247));
+        Line(325,y+row.height-1,valueRight,y+row.height-1,Col(255,255,255,15),1);
     }
-
-    // 底部留白，不再叠加会干扰视觉的小字
-
     g_rt->PopAxisAlignedClip();
-
-    // 边框光晕
-    if (active > 0.01f)
-    {
-        StrokeRRect(D2D1::RectF(base.left - 1.0f, base.top - 1.0f,
-            base.right + 1.0f, base.bottom + 1.0f), 17.0f,
-            Alpha(accent, 0.066f * active), 7.0f);
-        StrokeRRect(D2D1::RectF(base.left - 1.0f, base.top - 1.0f,
-            base.right + 1.0f, base.bottom + 1.0f), 17.0f,
-            Alpha(accent, 0.13f * active), 3.5f);
-    }
-    StrokeRRect(base, 16.0f,
-        selected ? Alpha(accent, 0.68f) : Alpha(Col(55, 62, 84), 1.0f),
-        1.0f + active * 0.55f);
-
-    // 内角
-    D2D1_COLOR_F corner = Alpha(accent, 0.16f + active * 0.62f);
-    float k = 14.0f;
-    Line(base.left + 9.0f, base.top + 9.0f, base.left + 9.0f + k, base.top + 9.0f, corner, 1.3f);
-    Line(base.left + 9.0f, base.top + 9.0f, base.left + 9.0f, base.top + 9.0f + k, corner, 1.3f);
-    Line(base.right - 9.0f - k, base.bottom - 9.0f, base.right - 9.0f, base.bottom - 9.0f, corner, 1.3f);
-    Line(base.right - 9.0f, base.bottom - 9.0f - k, base.right - 9.0f, base.bottom - 9.0f, corner, 1.3f);
-
-    if (useLayer) PopLayer();
-    g_rt->SetTransform(saved);
+    Scrollbar(1282,detailTop,detailBottom,g_detailScroll,g_detailMax);
+    if (HasSource()) Button(sourceButton,L"查看官网来源  ↗",true);
+    Text(L"滚轮翻阅参数",g_fonts.footer,{325,781,700,810},Col(148,160,180));
 }
 
 static void DrawEmptyState()
@@ -2251,13 +2116,19 @@ static void DrawEmptyState()
     Ring(cx, cy - 36.0f, 31.0f, Col(105, 120, 143, 26), 1.0f);
     DrawMiniGpuIcon(cx - 24.0f, cy - 51.0f, 48.0f, 28.0f, Col(137, 155, 178, 185));
 
-    Text(L"没有找到匹配的显卡", g_fonts.emptyTitle,
+    Text((g_cards.empty() ? L"此类别暂无本地数据" : L"没有找到匹配的硬件"), g_fonts.emptyTitle,
         D2D1::RectF(cx - 300.0f, cy + 8.0f, cx + 300.0f, cy + 38.0f),
         Col(218, 227, 243), DWRITE_TEXT_ALIGNMENT_CENTER);
-    Text(L"试一试更换关键词，或者清除当前筛选条件", g_fonts.emptyBody,
+    Text((g_cards.empty() ? L"点击顶栏的“同步数据”获取官网规格" : L"试一试更换关键词，或者清除当前筛选条件"), g_fonts.emptyBody,
         D2D1::RectF(cx - 300.0f, cy + 44.0f, cx + 300.0f, cy + 66.0f),
         Col(128, 140, 160), DWRITE_TEXT_ALIGNMENT_CENTER);
 
+    if (g_cards.empty())
+    {
+        PopLayer();
+        g_rt->SetTransform(saved);
+        return;
+    }
     bool hover = g_emptyHoverT > 0.35f;
     FillRRect(g_emptyResetRect, 9.0f,
         hover ? Col(107, 238, 152, 26) : Col(107, 238, 152, 9));
@@ -2271,52 +2142,15 @@ static void DrawEmptyState()
     g_rt->SetTransform(saved);
 }
 
-static void DrawCountBadge()
-{
-    D2D1_RECT_F badge = D2D1::RectF(1312.0f, 700.0f, 1468.0f, 736.0f);
-    float pulse = std::sin(Clamp01(g_countPulse) * 3.14159265f);
-    float scale = 1.0f + 0.035f * pulse;
-
-    D2D1_MATRIX_3X2_F saved{};
-    g_rt->GetTransform(&saved);
-    float cx = (badge.left + badge.right) * 0.5f;
-    float cy = (badge.top + badge.bottom) * 0.5f;
-    g_rt->SetTransform(D2D1::Matrix3x2F::Translation(cx, cy) *
-        D2D1::Matrix3x2F::Scale(scale, scale) *
-        D2D1::Matrix3x2F::Translation(-cx, -cy) * saved);
-
-    FillRRect(badge, 8.0f, Col(100, 239, 146, 14 + (int)(10 * pulse)));
-    StrokeRRect(badge, 8.0f, Col(102, 239, 148, 85), 0.9f);
-    DrawGridIcon(1326.0f, 710.0f, 14.0f, Col(113, 243, 158, 225));
-
-    int shown = (int)std::lround(g_countShown);
-    std::wstring countText = L"共 " + std::to_wstring(std::max(0, shown)) + L" 款显卡";
-    Text(countText, g_fonts.count,
-        D2D1::RectF(1348.0f, 708.0f, 1460.0f, 730.0f),
-        Col(129, 243, 169), DWRITE_TEXT_ALIGNMENT_LEADING,
-        DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-
-    g_rt->SetTransform(saved);
-}
-
 static void DrawFooter()
 {
-    DrawLogo(0, D2D1::RectF(CONTENT_L, 792.0f, CONTENT_L + 20.0f, 812.0f));
-
-    Text(L"NVIDIA", g_fonts.footerBold,
-        D2D1::RectF(CONTENT_L + 26.0f, 788.0f, CONTENT_L + 100.0f, 814.0f),
-        Col(105, 239, 150));
-
-    Line(CONTENT_L + 110.0f, 793.0f, CONTENT_L + 110.0f, 811.0f,
-        Col(255, 255, 255, 30), 1.0f);
-
-    Text(L"驱动更大的可能", g_fonts.footer,
-        D2D1::RectF(CONTENT_L + 126.0f, 791.0f, CONTENT_L + 320.0f, 814.0f),
-        Col(150, 160, 178));
-
-    Text(L"v1.0.0", g_fonts.footer,
-        D2D1::RectF(1402.0f, 791.0f, 1468.0f, 814.0f),
-        Col(112, 123, 142), DWRITE_TEXT_ALIGNMENT_TRAILING);
+    const auto& brand = g_brands[g_brand];
+    DrawLogo(g_brand, {CONTENT_L,789,CONTENT_L+26,815});
+    Text(brand.name, g_fonts.footerBold, {CONTENT_L+36,791,CONTENT_L+104,819},Accent());
+    Text(g_cpu ? L"处理器技术规格" : L"显卡技术规格", g_fonts.footer,
+        {CONTENT_L+120,791,CONTENT_L+325,819},Col(154,167,187));
+    Text(std::to_wstring(g_visibleCount) + (g_cpu ? L" 款 CPU" : L" 款 GPU"),g_fonts.count,
+        {1210,791,CONTENT_R,819},Accent(),DWRITE_TEXT_ALIGNMENT_TRAILING);
 }
 
 static void DrawFilterPopup()
@@ -2340,26 +2174,26 @@ static void DrawFilterPopup()
     FillRRect(popup, 12.0f, Col(17, 23, 38, 252));
     StrokeRRect(popup, 12.0f, Col(62, 73, 101, 220), 1.0f);
 
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 4; ++i)
     {
         D2D1_RECT_F row = FilterPopupRowRect(i);
-        bool selected = (i == 0 && g_tagFilter < 0) ||
-            (i > 0 && g_tagFilter == i - 1);
+        bool selected = (i == 0 && g_formFilter < 0) ||
+            (i > 0 && g_formFilter == i - 1);
         bool hovered = (g_filterHover == i);
 
         if (selected)
-            FillRRect(row, 7.0f, Col(98, 239, 146, 18));
+            FillRRect(row, 7.0f, Alpha(Accent(),0.08f));
         else if (hovered)
             FillRRect(row, 7.0f, Col(255, 255, 255, 10));
 
-        std::wstring label = (i == 0) ? L"全部" : g_tagNames[i - 1];
-        D2D1_COLOR_F color = selected ? Col(126, 244, 166) : Col(194, 205, 222);
+        std::wstring label = (i == 0) ? L"全部" : forms[i - 1];
+        D2D1_COLOR_F color = selected ? Accent() : Col(194, 205, 222);
         Text(label, g_fonts.sideItem,
             D2D1::RectF(row.left + 13.0f, row.top + 5.0f, row.right - 28.0f, row.bottom - 1.0f),
             color);
 
         if (selected)
-            DrawCheck(row.right - 17.0f, row.top + 15.0f, 10.0f, Col(118, 243, 162));
+            DrawCheck(row.right - 17.0f, row.top + 15.0f, 10.0f, Accent());
         else
             Text(L"·", g_fonts.sideItem,
                 D2D1::RectF(row.right - 22.0f, row.top + 2.0f, row.right - 8.0f, row.bottom),
@@ -2376,13 +2210,14 @@ static void DrawLibrary()
     DrawHeader();
     DrawSidebar();
 
-    for (int i = 0; i < (int)g_cards.size(); ++i)
-        DrawGpuCard(i);
-
-    DrawCountBadge();
+    g_rt->PushAxisAlignedClip(gridView,D2D1_ANTIALIAS_MODE_ALIASED);
+    for (int slot = FirstSlot(); slot < EndSlot(); ++slot) DrawCard(slot);
+    g_rt->PopAxisAlignedClip();
+    Scrollbar(CONTENT_R+13,gridView.top,gridView.bottom,g_gridScroll,g_gridMax);
     DrawEmptyState();
     DrawFooter();
     DrawFilterPopup();
+    if (g_detail >= 0) DrawDetail();
 }
 
 // ============================================================================
@@ -2395,12 +2230,11 @@ static void DrawToast()
 
     float a = 0.0f;
     if (g_toastTime < 0.22f) a = EaseOutCubic(g_toastTime / 0.22f);
-    else if (g_toastTime < 1.95f) a = 1.0f;
-    else a = 1.0f - Clamp01((g_toastTime - 1.95f) / 0.38f);
+    else if (g_toastTime < 6.6f) a = 1.0f;
+    else a = 1.0f - Clamp01((g_toastTime - 6.6f) / 0.38f);
     if (a <= 0.01f) return;
 
-    D2D1_RECT_F box = D2D1::RectF(DESIGN_W * 0.5f - 185.0f, 744.0f,
-        DESIGN_W * 0.5f + 185.0f, 786.0f);
+    auto box = toastBox;
 
     D2D1_MATRIX_3X2_F saved{};
     g_rt->GetTransform(&saved);
@@ -2412,10 +2246,13 @@ static void DrawToast()
     FillRRect(box, 11.0f, Col(20, 26, 41, 248));
     StrokeRRect(box, 11.0f, Alpha(g_toastColor, 0.50f), 1.0f);
     Circle(box.left + 22.0f, (box.top + box.bottom) * 0.5f, 3.2f, g_toastColor);
-    Text(g_toastText, g_fonts.toast,
-        D2D1::RectF(box.left + 36.0f, box.top + 9.0f, box.right - 18.0f, box.bottom),
-        Col(220, 228, 242), DWRITE_TEXT_ALIGNMENT_LEADING,
-        DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    bool longMessage = g_toastText.size() > 92;
+    auto preview = longMessage ? g_toastText.substr(0,92) + L"…" : g_toastText;
+    if (longMessage) Text(L"点击查看完整信息",g_fonts.tag,
+        {box.left+36,box.bottom-24,box.right-20,box.bottom},g_toastColor);
+    Wrapped(preview, g_fonts.toast,
+        D2D1::RectF(box.left + 36.0f, box.top + 9.0f, box.right - 18.0f, box.bottom - 5),
+        Col(220, 228, 242));
 
     PopLayer();
     g_rt->SetTransform(saved);
@@ -2573,47 +2410,63 @@ static void HandleSidebarClick(const SideRow& row)
     {
         group.expanded = !group.expanded;
         group.expandTarget = group.expanded ? 1.0f : 0.0f;
-        // 展开靠底部的分组时，让列表自动滚到新内容
-        if (group.expanded && row.group >= 2)
-        {
-            g_sideScrollToBottom = true;
-            g_sideScrollTarget = 100000.0f;
-        }
-        else if (!group.expanded)
-        {
-            g_sideScrollToBottom = false;
-        }
         StartAnimation();
         return;
     }
 
     if (row.item < 0 || row.item >= (int)group.items.size()) return;
 
-    const std::wstring& item = group.items[row.item];
-    if (g_seriesFilter == item)
-        g_seriesFilter.clear();
-    else
-        g_seriesFilter = item;
-
-    // 系列切换时清掉容易冲突的搜索 / 标签条件
-    g_searchText.clear();
+    const auto& item = group.items[row.item].first;
+    bool selected = g_seriesFilter == item && g_seriesForm == group.form;
+    g_seriesFilter = selected ? L"" : item;
+    g_seriesForm = selected ? L"" : group.form;
     g_searchFocused = false;
-    g_tagFilter = -1;
     ApplyFilters();
     StartAnimation();
 }
 
+static void StartSync()
+{
+    if (g_syncBusy) return;
+    if (g_catalog.path.empty()) { ShowToast(L"无法定位数据库：" + g_dbError, Accent()); return; }
+    g_searchFocused = false;
+    g_cancel.reset(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    if (!g_cancel) { ShowToast(L"无法创建后台同步任务",Accent()); return; }
+    auto root = g_catalog.path.parent_path();
+    auto brand = Lower(g_brands[g_brand].name);
+    std::wstring category = g_cpu ? L"cpu" : L"gpu";
+    try
+    {
+        g_worker = std::thread([root, brand, category, window=g_hwnd, cancel=g_cancel.get()] {
+            g_result = corebase::RunSync(root,brand,category,cancel);
+            g_result.message = brand + L" " + category + L" · " + g_result.message;
+            PostMessageW(window,SyncComplete,0,0);
+        });
+        g_syncBusy = true;
+    }
+    catch (const std::system_error& e) { ShowToast(corebase::FromUtf8(e.what()),Accent()); }
+}
 static void HandleLibraryClick(const D2D1_POINT_2F& p)
 {
+    if (g_detail >= 0)
+    {
+        if (!InRect(detailPanel,p) || InRect(closeButton,p)) g_detail = -1;
+        else if (InRect(sourceButton,p) && HasSource())
+        {
+            auto result = ShellExecuteW(g_hwnd,L"open",g_cards[g_detail].item->source_url.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(result) <= 32) ShowToast(L"无法打开官网链接",Accent());
+        }
+        return;
+    }
     if (g_filterOpen)
     {
         if (InRect(FilterPopupRect(), p))
         {
-            for (int i = 0; i < 5; ++i)
+            for (int i = 0; i < 4; ++i)
             {
                 if (InRect(FilterPopupRowRect(i), p))
                 {
-                    g_tagFilter = (i == 0) ? -1 : (i - 1);
+                    g_formFilter = (i == 0) ? -1 : (i - 1);
                     g_filterOpen = false;
                     ApplyFilters();
                     StartAnimation();
@@ -2633,6 +2486,14 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
         // 关闭筛选面板后，本次点击继续交给下面的按钮 / 卡片处理
     }
 
+    if (InRect(syncButton,p)) { StartSync(); return; }
+    if (InRect(gpuTab,p) || InRect(cpuTab,p))
+    {
+        bool cpu = InRect(cpuTab,p);
+        if (cpu && g_brand == 0) { ShowToast(L"NVIDIA 暂无 CPU 采集来源",Accent()); return; }
+        if (cpu != g_cpu) { g_cpu = cpu; ResetLibraryState(); }
+        return;
+    }
     if (InRect(g_backRect, p))
     {
         NavigateTo(Page::Home);
@@ -2672,11 +2533,11 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
         return;
     }
 
-    if (g_visibleCount == 0 && InRect(g_emptyResetRect, p))
+    if (!g_cards.empty() && g_visibleCount == 0 && InRect(g_emptyResetRect, p))
     {
         g_searchText.clear();
         g_seriesFilter.clear();
-        g_tagFilter = -1;
+        g_formFilter = -1;
         g_searchFocused = false;
         ApplyFilters();
         StartAnimation();
@@ -2701,22 +2562,28 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
         }
     }
 
-    for (int i = 0; i < (int)g_cards.size(); ++i)
+    if (g_gridMax > 0 && InRect({CONTENT_R+5,gridView.top,PANEL_R-5,gridView.bottom},p))
     {
-        auto& card = g_cards[i];
-        if (!card.visible || card.presence < 0.4f) continue;
-        if (InRect(D2D1::RectF(card.x, card.y, card.x + CARD_W, card.y + CARD_H), p))
-        {
-            g_selectedCard = i;
-            StartAnimation();
-            return;
-        }
+        float top = GridThumbTop(), height = ThumbHeight(gridView.bottom-gridView.top,g_gridMax);
+        g_dragOffset = (p.y >= top && p.y <= top+height) ? p.y-top : height/2;
+        g_dragGrid = true;
+        SetCapture(g_hwnd);
+        DragGrid(p.y);
+        return;
     }
+    int index = CardAt(p);
+    if (index >= 0) OpenDetail(index);
 }
 
 static void HandleClick(const D2D1_POINT_2F& p)
 {
     if (g_navActive) return;
+    if (g_toastVisible && g_toastText.size() > 92 && InRect(toastBox,p))
+    {
+        auto message = g_toastText;
+        MessageBoxW(g_hwnd,message.c_str(),L"CoreBase · 同步信息",MB_OK | MB_ICONINFORMATION);
+        return;
+    }
 
     if (g_page == Page::Home)
     {
@@ -2724,15 +2591,9 @@ static void HandleClick(const D2D1_POINT_2F& p)
         {
             if (InRect(g_brands[i].rect, p))
             {
-                if (i == 0)
-                {
-                    NavigateTo(Page::Library);
-                }
-                else
-                {
-                    ShowToast(i == 1 ? L"AMD 显卡库正在建设中 · 敬请期待"
-                        : L"Intel 显卡库正在建设中 · 敬请期待", g_brands[i].accent);
-                }
+                g_brand = i;
+                g_cpu = false;
+                NavigateTo(Page::Library);
                 StartAnimation();
                 return;
             }
@@ -2770,8 +2631,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         CreateFonts();
 
         InitData();
-        ApplyFilters();
-        SnapCardsToLayout();
+        if (!g_dbError.empty()) ShowToast(L"无法读取硬件数据库：" + g_dbError, Col(255,151,118));
+
         g_homeIntro = 0.0f;
         g_libIntro = 0.0f;
 
@@ -2842,6 +2703,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_mousePx.x = GET_X_LPARAM(lParam);
         g_mousePx.y = GET_Y_LPARAM(lParam);
         g_mouseInside = ToDesignPoint(g_mousePx.x, g_mousePx.y, g_mouse);
+        if (g_dragGrid) DragGrid(g_mouse.y);
         if (!g_mouseTracking)
         {
             TRACKMOUSEEVENT tme{};
@@ -2889,6 +2751,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_LBUTTONUP:
+        if (g_dragGrid) ReleaseCapture();
+        break;
+    case WM_CAPTURECHANGED:
+        g_dragGrid = false;
         break;
 
     case WM_MOUSEWHEEL:
@@ -2900,11 +2766,22 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         D2D1_POINT_2F p{};
         if (!ToDesignPoint(screen.x, screen.y, p)) break;
 
+        float wheel = GET_WHEEL_DELTA_WPARAM(wParam) / 120.0f;
+        if (g_detail >= 0)
+        {
+            g_detailScroll = std::clamp(g_detailScroll-wheel*86,0.0f,g_detailMax);
+            StartAnimation();
+            break;
+        }
         if (g_filterOpen) break;
+        if (InRect(gridView,p))
+        {
+            g_gridTarget = std::clamp(g_gridTarget-wheel*135,0.0f,g_gridMax);
+            StartAnimation();
+        }
         if (p.x >= PANEL_L && p.x <= SIDEBAR_R && p.y >= SIDE_TOP && p.y <= SIDE_BOTTOM)
         {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_sideScrollToBottom = false;
             g_sideScrollTarget -= (delta / 120.0f) * 54.0f;
             g_sideScrollTarget = std::max(0.0f, std::min(g_sideScrollTarget, g_sideScrollMax));
             StartAnimation();
@@ -2916,6 +2793,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
         if (g_page != Page::Library || g_navActive) break;
 
+        if (g_detail >= 0) break;
         wchar_t ch = (wchar_t)wParam;
         if (ch == VK_BACK || ch == 8)
         {
@@ -2940,6 +2818,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_IME_CHAR:
     {
+        if (g_detail >= 0) break;
         if (g_page == Page::Library && !g_navActive)
         {
             if (!g_searchFocused) g_searchFocused = true;
@@ -2950,6 +2829,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_KEYDOWN:
     {
+        if (g_detail >= 0)
+        {
+            if (wParam == VK_ESCAPE) g_detail = -1;
+            if (wParam == VK_NEXT) g_detailScroll = std::min(g_detailMax,g_detailScroll + 510);
+            if (wParam == VK_PRIOR) g_detailScroll = std::max(0.0f,g_detailScroll - 510);
+            StartAnimation();
+            break;
+        }
         if (wParam == VK_ESCAPE)
         {
             if (g_filterOpen)
@@ -3047,8 +2934,36 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
     }
 
+    case SyncComplete:
+    {
+        g_worker.join();
+        g_cancel.reset();
+        g_syncBusy = false;
+        if (g_closing) { DestroyWindow(hWnd); return 0; }
+        bool loaded = ReloadCatalog();
+        RebuildLibrary();
+        auto message = g_result.message;
+        if (!loaded) message += L" · 刷新数据库失败：" + g_dbError;
+        ShowToast(message,loaded && g_result.ok ? Accent() : Col(255,151,118));
+        break;
+    }
+    case WM_CLOSE:
+        if (g_syncBusy)
+        {
+            g_closing = true;
+            SetEvent(g_cancel.get());
+            ShowWindow(hWnd,SW_HIDE);
+        }
+        else DestroyWindow(hWnd);
+        return 0;
     case WM_DESTROY:
     {
+        if (g_worker.joinable())
+        {
+            SetEvent(g_cancel.get());
+            g_worker.join();
+            g_cancel.reset();
+        }
         StopAnimation();
         DiscardDeviceResources();
         DestroyFonts();
