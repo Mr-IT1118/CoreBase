@@ -1,0 +1,4 @@
+#include ".vscode/Resource.h"
+IDB_PNG3 RCDATA "assets/nvidia.png"
+IDB_PNG2 RCDATA "assets/intel.png"
+IDB_PNG1 RCDATA "assets/amd.png"
