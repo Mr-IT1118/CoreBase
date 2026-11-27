@@ -1,6 +1,6 @@
 """CoreBase official GPU collector. Requires: pip install playwright.
 
-Returns the original five input fields consumed by the CoreBase database layer.
+Returns validated desktop GPU specifications consumed by the CoreBase database layer.
 Only complete desktop GPU records are returned. No guessed specifications.
 """
 
@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
@@ -50,6 +51,100 @@ def slug(value):
     return re.sub(r"[^a-z0-9]+", "-", clean(value).lower()).strip("-")
 
 
+COMPUTE_UNIT_TYPES = {
+    "nvidia": "CUDA Cores",
+    "amd": "Stream Processors",
+    "intel": "Xe-Cores",
+}
+_MISSING_TEXT = {"", "-", "--", "n/a", "na", "none", "tbd", "varies by manufacturer"}
+
+
+def _clean_optional(value):
+    if value is None:
+        return None
+    text = clean(str(value))
+    return None if text.casefold() in _MISSING_TEXT else text
+
+
+def parse_int_spec(value, *, min_val=1, max_val=1000000):
+    text = _clean_optional(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d[\d,]*)", text)
+    if not match:
+        return None
+    num = int(match.group(1).replace(",", ""))
+    return num if min_val <= num <= max_val else None
+
+
+def parse_watts(value):
+    text = _clean_optional(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d[\d,]*)\s*W?", text, re.I)
+    if not match:
+        return None
+    watts = int(match.group(1).replace(",", ""))
+    return watts if 1 <= watts <= 2000 else None
+
+
+def parse_clock_mhz(value, default_unit="MHz"):
+    text = _clean_optional(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(GHz|MHz)?", text, re.I)
+    if not match:
+        return None
+    unit = (match.group(2) or default_unit).upper()
+    try:
+        mhz = Decimal(match.group(1)) * (1000 if unit == "GHZ" else 1)
+    except InvalidOperation:
+        return None
+    val = int(round(mhz))
+    return val if 1 <= val <= 20000 else None
+
+
+def parse_bandwidth_gbps(value):
+    text = _clean_optional(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:GB/(?:s|sec)|GBps)", text, re.I)
+    if not match:
+        return None
+    val = float(match.group(1))
+    return val if 0 < val <= 100000 else None
+
+
+def parse_year(value):
+    text = _clean_optional(value)
+    if not text:
+        return None
+    full = re.search(r"\b(?:19|20)\d{2}\b", text)
+    if full:
+        return int(full.group(0))
+    short = re.fullmatch(r"(?:Q[1-4]\s*['\u2019]\s*|\d{1,2}/\d{1,2}/)(\d{2})", text, re.I)
+    if short:
+        yy = int(short.group(1))
+        return (1900 if yy >= 70 else 2000) + yy
+    return None
+
+
+def _split_variants(value, count):
+    text = _clean_optional(value)
+    if not text:
+        return [None] * count
+    parts = [
+        p.strip()
+        for p in re.split(r"\s+/\s+|\s+or\s+|(?<=\d)/(?=\d)", text, flags=re.I)
+        if p.strip()
+    ]
+    if len(parts) == count:
+        return parts
+    if len(parts) == 1:
+        return parts * count
+    return [None] * count
+
+
 def memory_variants(value):
     """Preserve capacity and type, e.g. 12 GB GDDR6 / 12 GB GDDR6X."""
     parts = re.split(r"\s*/\s*|\s+or\s+", clean(value), flags=re.I)
@@ -72,7 +167,7 @@ def memory_variants(value):
     return variants
 
 
-def records(vendor, model, memory, bus, source_url, identity=None):
+def records(vendor, model, memory, bus, source_url, identity=None, specs=None):
     variants = memory_variants(memory)
     widths = re.findall(r"(?<!\d)(\d+)\s*[-\u2013\u2014]?\s*bits?\b", bus, re.I)
     if len(widths) not in (1, len(variants)):
@@ -82,37 +177,133 @@ def records(vendor, model, memory, bus, source_url, identity=None):
     model = clean(model)
     if vendor == "nvidia" and not model.startswith("NVIDIA"):
         model = "NVIDIA " + model
+    per_variant = specs if isinstance(specs, list) else [specs or {}] * len(variants)
+    if len(per_variant) != len(variants):
+        per_variant = [{}] * len(variants)
     output = []
-    for (size, kind), width in zip(variants, widths):
+    for (size, kind), width, extra in zip(variants, widths, per_variant):
         width = int(width)
         if not 0 < width <= 8192:
             raise ValueError(f"Invalid memory interface: {width}")
         # Capacity/type form part of the key: variants must not overwrite each other.
         product_id = f"{vendor}-{slug(identity or model)}-{size}gb-{kind.lower()}"
+        compute_units = extra.get("compute_units")
         output.append({
             "product_id": product_id,
             "model": f"{model} [{size} GB {kind}]",
+            "architecture": extra.get("architecture"),
+            "compute_units": compute_units,
+            "compute_unit_type": COMPUTE_UNIT_TYPES[vendor] if compute_units is not None else None,
+            "base_clock_mhz": extra.get("base_clock_mhz"),
+            "boost_clock_mhz": extra.get("boost_clock_mhz"),
             "vram_gb": size,
+            "vram_type": kind,
             "bus_bits": width,
+            "bandwidth_gbps": extra.get("bandwidth_gbps"),
+            "tdp_w": extra.get("tdp_w"),
+            "recommended_psu_w": extra.get("recommended_psu_w"),
+            "pcie_interface": extra.get("pcie_interface"),
+            "release_year": extra.get("release_year"),
             "source_url": source_url,
         })
     return output
+
+
+def _nvidia_architecture(by_label, index):
+    for key in ("NVIDIA Architecture", "NVIDIA Architecture Name"):
+        row = by_label.get(key)
+        if row:
+            arch = _clean_optional(row[index])
+            if arch:
+                return arch
+    shader_row = by_label.get("Shader Cores")
+    if shader_row:
+        raw = _clean_optional(shader_row[index])
+        if raw:
+            cleaned = re.sub(r"\s+\d+(?:\.\d+)?\s*TFLOPS$", "", raw, flags=re.I).strip()
+            if cleaned and not cleaned.isdigit():
+                return cleaned
+    return None
+
+
+def _nvidia_pcie(rows, by_label, index):
+    pcie_row = by_label.get("PCI Express")
+    if pcie_row:
+        val = _clean_optional(pcie_row[index])
+        if val and val.casefold() != "no":
+            return f"PCIe {val}" if val.lower().startswith("gen ") else val
+    for row in rows:
+        if not row:
+            continue
+        match = re.fullmatch(r"PCI Express (Gen \d+)", clean(row[0]), re.I)
+        if match and index < len(row) and clean(row[index]).casefold() == "yes":
+            return f"PCIe {match.group(1)}"
+    return None
+
+
+def _nvidia_clock_row(by_label, base_name):
+    for unit in ("GHz", "MHz"):
+        row = by_label.get(f"{base_name} ({unit})")
+        if row:
+            return row, unit
+    return None, None
+
+
+def _nvidia_specs(rows, by_label, index, variant_count):
+    cuda_row = by_label.get("NVIDIA CUDA Cores")
+    base_row, base_unit = _nvidia_clock_row(by_label, "Base Clock")
+    boost_row, boost_unit = _nvidia_clock_row(by_label, "Boost Clock")
+    bw_row = by_label.get("Memory Bandwidth")
+    tdp_row = by_label.get("Total Graphics Power (W)") or by_label.get("Graphics Card Power (W)")
+    psu_row = next(
+        (r for k, r in by_label.items()
+         if k.startswith(("Required System Power (W)", "Minimum System Power (W)"))),
+        None,
+    )
+    arch = _nvidia_architecture(by_label, index)
+    pcie = _nvidia_pcie(rows, by_label, index)
+
+    cudas = _split_variants(cuda_row[index] if cuda_row else None, variant_count)
+    bases = _split_variants(base_row[index] if base_row else None, variant_count)
+    boosts = _split_variants(boost_row[index] if boost_row else None, variant_count)
+    bws = _split_variants(bw_row[index] if bw_row else None, variant_count)
+    tdps = _split_variants(tdp_row[index] if tdp_row else None, variant_count)
+    psus = _split_variants(psu_row[index] if psu_row else None, variant_count)
+
+    return [{
+        "architecture": arch,
+        "compute_units": parse_int_spec(cudas[i], max_val=200000),
+        "base_clock_mhz": parse_clock_mhz(bases[i], base_unit or "MHz"),
+        "boost_clock_mhz": parse_clock_mhz(boosts[i], boost_unit or "MHz"),
+        "bandwidth_gbps": parse_bandwidth_gbps(bws[i]),
+        "tdp_w": parse_watts(tdps[i]),
+        "recommended_psu_w": parse_watts(psus[i]),
+        "pcie_interface": pcie,
+    } for i in range(variant_count)]
 
 
 def parse_nvidia(tables):
     output, skipped = [], []
     for table in tables:
         rows = [[cell["text"] for cell in row] for row in table]
-        memory = next((r for r in rows if r and r[0] == "Standard Memory Config"), None)
+        memory = next((r for r in rows if r and clean(r[0]) == "Standard Memory Config"), None)
         if memory is None:
             continue
         header = next((r for r in rows if sum("GeForce" in c for c in r) >= 1), None)
-        bus = next((r for r in rows if r and r[0] == "Memory Interface Width"), None)
+        bus = next((r for r in rows if r and clean(r[0]) == "Memory Interface Width"), None)
         if not header or not bus or not (len(header) == len(memory) == len(bus)):
             raise ValueError("NVIDIA table columns changed; refused to guess alignment")
+        by_label = {}
+        for row in rows:
+            if row and len(row) == len(header):
+                label = clean(row[0])
+                if label and label not in by_label:
+                    by_label[label] = row
         for index in range(1, len(header)):
             try:
-                output.extend(records("nvidia", header[index], memory[index], bus[index], NVIDIA_URL))
+                variant_count = len(memory_variants(memory[index]))
+                specs = _nvidia_specs(rows, by_label, index, variant_count)
+                output.extend(records("nvidia", header[index], memory[index], bus[index], NVIDIA_URL, specs=specs))
             except ValueError as exc:
                 skipped.append(f"{header[index]}: {exc}")
     if not output:
@@ -155,6 +346,43 @@ def amd_expected_total(summary):
     return int(match.group(1).replace(",", ""))
 
 
+def _amd_single(fields, key):
+    if key not in fields:
+        return None
+    vals = amd_field_values(fields[key])
+    return vals[0] if len(vals) == 1 else None
+
+
+def _amd_architecture(fields):
+    explicit = _clean_optional(_amd_single(fields, "architecture"))
+    if explicit:
+        return re.sub(r"\s+Architecture$", "", explicit, flags=re.I)
+    if "supportedTechnologies" not in fields:
+        return None
+    techs = amd_field_values(fields["supportedTechnologies"])
+    arch_hits = [re.sub(r"\s+Architecture$", "", t, flags=re.I) for t in techs
+                 if re.search(r"\bArchitecture$", t, re.I)]
+    return arch_hits[0] if len(arch_hits) == 1 else None
+
+
+def _amd_specs(fields):
+    base_raw = _amd_single(fields, "baseFrequency") or _amd_single(fields, "gameFrequency")
+    pcie_raw = _clean_optional(_amd_single(fields, "busType"))
+    if pcie_raw and "pci" not in pcie_raw.casefold():
+        pcie_raw = None
+    return {
+        "architecture": _amd_architecture(fields),
+        "compute_units": parse_int_spec(_amd_single(fields, "streamProcessors"), max_val=200000),
+        "base_clock_mhz": parse_clock_mhz(base_raw),
+        "boost_clock_mhz": parse_clock_mhz(_amd_single(fields, "boostFrequency")),
+        "bandwidth_gbps": parse_bandwidth_gbps(_amd_single(fields, "memoryBandwidth")),
+        "tdp_w": parse_watts(_amd_single(fields, "typicalBoardPowerDesktop")),
+        "recommended_psu_w": parse_watts(_amd_single(fields, "minimumPsuRecommendation")),
+        "pcie_interface": pcie_raw,
+        "release_year": parse_year(_amd_single(fields, "launchDate")),
+    }
+
+
 def parse_amd_payload(payload, expected_total=None):
     """Parse every product in AMD's public table dataset, not one display page."""
     items = payload.get("items") if isinstance(payload, dict) else None
@@ -191,6 +419,7 @@ def parse_amd_payload(payload, expected_total=None):
             output.extend(records(
                 "amd", name, sizes[0] + " " + kinds[0],
                 " / ".join(amd_field_values(fields["memoryInterface"])), AMD_URL,
+                specs=_amd_specs(fields),
             ))
         except ValueError as exc:
             skipped.append(f"{name}: {exc}")
@@ -200,21 +429,38 @@ def parse_amd_payload(payload, expected_total=None):
 
 
 def parse_intel(tables, source_url):
-    data = {row[0]["text"]: row[1]["text"]
+    data = {clean(row[0]["text"]).replace("\u2021", "").replace("\u2020", "").strip().casefold():
+            clean(row[1]["text"])
             for table in tables for row in table if len(row) == 2}
-    if data.get("Vertical Segment") != "Desktop":
+
+    def get(*labels):
+        return next((data[k] for k in labels if data.get(k)), None)
+
+    if get("vertical segment") != "Desktop":
         raise ValueError("Intel product is not confirmed as a desktop GPU")
-    model = data.get("Model Number", "")
+    model = get("model number") or ""
     if not re.fullmatch(r"[A-Z]\d{3}", model):
         raise ValueError("Intel desktop model number was not found")
     sku = re.search(r"/sku/(\d+)/", source_url)
     if not sku:
         raise ValueError("Intel SKU was not found in the source URL")
     # B-series combines these fields; A-series lists capacity and type separately.
-    memory = data.get("Memory") or (data.get("Memory Size", "") + " " + data.get("Memory Type", ""))
+    memory = get("memory") or ((get("memory size") or "") + " " + (get("memory type") or ""))
+    specs = {
+        "architecture": _clean_optional(get("microarchitecture", "graphics microarchitecture")),
+        "compute_units": parse_int_spec(get("xe-cores", "xe cores"), max_val=10000),
+        "base_clock_mhz": parse_clock_mhz(get("graphics clock")),
+        "boost_clock_mhz": parse_clock_mhz(
+            get("graphics max dynamic frequency", "max dynamic frequency", "boost clock")
+        ),
+        "bandwidth_gbps": parse_bandwidth_gbps(get("graphics memory bandwidth", "memory bandwidth")),
+        "tdp_w": parse_watts(get("total board power (tbp)", "total board power", "tdp")),
+        "pcie_interface": _clean_optional(get("pci express configurations", "pci express revision")),
+        "release_year": parse_year(get("launch date")),
+    }
     return records("intel", f"Intel Arc {model}", memory,
-                   data.get("Graphics Memory Interface", ""), source_url,
-                   identity="sku-" + sku.group(1))
+                   get("graphics memory interface") or "", source_url,
+                   identity="sku-" + sku.group(1), specs=specs)
 
 
 def navigate(page, url, domain):

@@ -4,12 +4,15 @@ import copy
 import io
 import json
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import collector
+import database
 
 
 # Relevant fields from AMD's actual data-json attribute, observed 2026-11-24 UTC.
@@ -105,6 +108,140 @@ class ExistingVendorTests(unittest.TestCase):
                     ["Graphics Memory Interface", f"{width} bit"], *fields,
                 ])], f"https://www.intel.com/content/www/us/en/products/sku/{sku}/gpu/specifications.html")
                 self.assertEqual((rows[0]["vram_gb"], rows[0]["bus_bits"]), (size, width))
+
+    def test_nvidia_extended_specs_and_variants(self):
+        rows, _ = collector.parse_nvidia([
+            table([
+                ["", "GeForce RTX 5090", "GeForce RTX 4090"],
+                ["NVIDIA CUDA \u00ae Cores", "21760", "16384"],
+                ["Shader Cores", "Blackwell", "Ada Lovelace 83 TFLOPS"],
+                ["Boost Clock (GHz)", "2.41", "2.52"],
+                ["Base Clock (GHz)", "2.01", "2.23"],
+                ["Standard Memory Config", "32 GB GDDR7", "24 GB GDDR6X"],
+                ["Memory Interface Width", "512-bit", "384-bit"],
+                ["Memory Bandwidth", "1792 GB/sec", "1008 GB/sec"],
+                ["PCI Express", "Gen 5", "Gen 4"],
+                ["Total Graphics Power (W)", "575", "450"],
+                ["Required System Power (W) (5)", "1000", "850"],
+            ]),
+            table([
+                ["", "GeForce RTX 3080", "GeForce GTX 1660 Ti"],
+                ["NVIDIA CUDA \u00ae Cores", "8960 / 8704", "1536"],
+                ["Boost Clock (MHz)", "1710", "1770"],
+                ["Base Clock (MHz)", "1260 / 1440", "1500"],
+                ["Standard Memory Config", "12 GB GDDR6X / 10 GB GDDR6X", "6GB GDDR6"],
+                ["Memory Interface Width", "384-bit / 320-bit", "192-bit"],
+                ["NVIDIA Architecture Name", "Ampere", "Turing"],
+                ["PCI Express Gen 4", "Yes", "-"],
+                ["Graphics Card Power (W)", "350 / 320", "120"],
+                ["Minimum System Power (W) (3)", "750", "450"],
+            ]),
+        ])
+        by_id = {r["product_id"]: r for r in rows}
+        rtx5090 = by_id["nvidia-nvidia-geforce-rtx-5090-32gb-gddr7"]
+        self.assertEqual(rtx5090["architecture"], "Blackwell")
+        self.assertEqual(rtx5090["compute_units"], 21760)
+        self.assertEqual(rtx5090["compute_unit_type"], "CUDA Cores")
+        self.assertEqual((rtx5090["base_clock_mhz"], rtx5090["boost_clock_mhz"]), (2010, 2410))
+        self.assertEqual((rtx5090["tdp_w"], rtx5090["recommended_psu_w"]), (575, 1000))
+        self.assertEqual((rtx5090["bandwidth_gbps"], rtx5090["pcie_interface"]), (1792.0, "PCIe Gen 5"))
+
+        self.assertEqual(by_id["nvidia-nvidia-geforce-rtx-4090-24gb-gddr6x"]["architecture"], "Ada Lovelace")
+
+        rtx3080_12 = by_id["nvidia-nvidia-geforce-rtx-3080-12gb-gddr6x"]
+        rtx3080_10 = by_id["nvidia-nvidia-geforce-rtx-3080-10gb-gddr6x"]
+        self.assertEqual((rtx3080_12["compute_units"], rtx3080_12["base_clock_mhz"], rtx3080_12["tdp_w"]), (8960, 1260, 350))
+        self.assertEqual((rtx3080_10["compute_units"], rtx3080_10["base_clock_mhz"], rtx3080_10["tdp_w"]), (8704, 1440, 320))
+        self.assertEqual(rtx3080_12["pcie_interface"], "PCIe Gen 4")
+
+        gtx1660ti = by_id["nvidia-nvidia-geforce-gtx-1660-ti-6gb-gddr6"]
+        self.assertEqual((gtx1660ti["architecture"], gtx1660ti["boost_clock_mhz"], gtx1660ti["tdp_w"]), ("Turing", 1770, 120))
+
+    def test_amd_extended_specs_and_ambiguous_ranges(self):
+        payload = {"items": [
+            {"elements": {
+                "name": {"formatValue": "AMD Radeon\u2122 RX 9070 XT"},
+                "boardType": {"formatValue": ["Desktop"]},
+                "maxMemorySize": {"formatValue": "16", "suffix": " GB"},
+                "memoryType": {"formatValue": ["GDDR6"]},
+                "memoryInterface": {"formatValue": "256-bit"},
+                "streamProcessors": {"formatValue": ["4096"]},
+                "gameFrequency": {"formatValue": "2400 MHz"},
+                "boostFrequency": {"formatValue": ["2970 MHz"]},
+                "memoryBandwidth": {"formatValue": "640", "suffix": " GB/s"},
+                "typicalBoardPowerDesktop": {"formatValue": "304W"},
+                "minimumPsuRecommendation": {"formatValue": "750", "suffix": "W"},
+                "busType": {"formatValue": ["PCIe\u00ae 5.0 x16"]},
+                "launchDate": {"formatValue": "Q1 2025"},
+            }},
+            {"elements": {
+                "name": {"formatValue": "Radeon\u2122 RX 560"},
+                "boardType": {"formatValue": ["Desktop"]},
+                "maxMemorySize": {"formatValue": "4", "suffix": " GB"},
+                "memoryType": {"formatValue": ["GDDR5"]},
+                "memoryInterface": {"formatValue": "128-bit"},
+                "streamProcessors": {"formatValue": ["896", "1024"]},
+                "baseFrequency": {"formatValue": ["1175 MHz"]},
+                "boostFrequency": {"formatValue": ["1275 MHz"]},
+                "typicalBoardPowerDesktop": {"formatValue": "60-80 W"},
+                "supportedTechnologies": {"formatValue": ["4th Gen GCN Architecture", "AMD FreeSync\u2122 Technology"]},
+            }},
+        ]}
+        rows, _ = collector.parse_amd_payload(payload, 2)
+        rx9070 = rows[0]
+        self.assertEqual(rx9070["compute_units"], 4096)
+        self.assertEqual(rx9070["compute_unit_type"], "Stream Processors")
+        self.assertEqual((rx9070["base_clock_mhz"], rx9070["boost_clock_mhz"]), (2400, 2970))
+        self.assertEqual((rx9070["tdp_w"], rx9070["recommended_psu_w"]), (304, 750))
+        self.assertEqual((rx9070["bandwidth_gbps"], rx9070["pcie_interface"], rx9070["release_year"]), (640.0, "PCIe 5.0 x16", 2025))
+
+        rx560 = rows[1]
+        self.assertIsNone(rx560["compute_units"])
+        self.assertIsNone(rx560["tdp_w"])
+        self.assertEqual(rx560["architecture"], "4th Gen GCN")
+
+    def test_intel_extended_specs(self):
+        rows = collector.parse_intel([table([
+            ["Vertical Segment", "Desktop"],
+            ["Model Number", "B580"],
+            ["Microarchitecture", "Xe2"],
+            ["Launch Date", "Q4'24"],
+            ["Xe-cores", "20"],
+            ["Graphics Clock", "2670 MHz"],
+            ["Total Board Power (TBP)", "190 W"],
+            ["Memory", "12 GB GDDR6"],
+            ["Graphics Memory Interface", "192 bit"],
+            ["Graphics Memory Bandwidth", "456 GB/s"],
+            ["PCI Express Configurations", "PCI Express 4.0 x8"],
+        ])], "https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html")
+        b580 = rows[0]
+        self.assertEqual(b580["architecture"], "Xe2")
+        self.assertEqual((b580["compute_units"], b580["compute_unit_type"]), (20, "Xe-Cores"))
+        self.assertEqual((b580["base_clock_mhz"], b580["tdp_w"], b580["release_year"]), (2670, 190, 2024))
+        self.assertEqual((b580["bandwidth_gbps"], b580["pcie_interface"]), (456.0, "PCI Express 4.0 x8"))
+
+    def test_extended_specs_persist_to_database(self):
+        rows = collector.parse_intel([table([
+            ["Vertical Segment", "Desktop"],
+            ["Model Number", "B580"],
+            ["Microarchitecture", "Xe2"],
+            ["Xe-cores", "20"],
+            ["Graphics Clock", "2670 MHz"],
+            ["Total Board Power (TBP)", "190 W"],
+            ["Memory", "12 GB GDDR6"],
+            ["Graphics Memory Interface", "192 bit"],
+        ])], "https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html")
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_db = Path(tmp) / "test_hardware.db"
+            with patch.object(database, "DB_PATH", temp_db):
+                database.save_gpus(rows, brand="intel")
+                saved = database.get_gpus()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["architecture"], "Xe2")
+        self.assertEqual(saved[0]["compute_units"], 20)
+        self.assertEqual(saved[0]["compute_unit_type"], "Xe-Cores")
+        self.assertEqual(saved[0]["base_clock_mhz"], 2670)
+        self.assertEqual(saved[0]["tdp_w"], 190)
 
 
 class BrowserError(Exception):
