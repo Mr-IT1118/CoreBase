@@ -240,7 +240,7 @@ static bool g_dragGrid = false;
 static float g_dragOffset = 0;
 static float g_gridScroll = 0, g_gridTarget = 0, g_gridVel = 0, g_gridMax = 0;
 static const D2D1_RECT_F gridView{ CONTENT_L - 8, GRID_TOP - 5, CONTENT_R + 8, FOOTER_LINE_Y - 12 };
-static const D2D1_RECT_F gpuTab{742,101,839,143}, cpuTab{843,101,953,143}, syncButton{970,101,1077,143};
+static const D2D1_RECT_F gpuTab{742,101,839,143}, cpuTab{853,101,953,143}, syncButton{970,101,1077,143};
 static const D2D1_RECT_F detailPanel{295,72,1305,832}, closeButton{1200,92,1270,130}, sourceButton{1080,770,1270,810};
 static bool g_syncBusy = false, g_closing = false;
 static corebase::detail::Handle g_cancel;
@@ -269,6 +269,7 @@ static std::wstring g_seriesFilter;
 // 搜索 / 筛选
 static std::wstring g_searchText;
 static bool g_searchFocused = false;
+static float g_caretTime = 0.0f;
 static float g_searchFocusT = 0.0f;
 static float g_searchFocusVel = 0.0f;
 static float g_searchHoverT = 0.0f;
@@ -629,8 +630,8 @@ static void CreateStaticGradients()
             D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &collection);
         g_rt->CreateLinearGradientBrush(
             D2D1::LinearGradientBrushProperties(
-                D2D1::Point2F(620.0f, 150.0f),
-                D2D1::Point2F(980.0f, 220.0f)),
+                D2D1::Point2F(400.0f, 150.0f),
+                D2D1::Point2F(1200.0f, 220.0f)),
             D2D1::BrushProperties(), collection, &g_homeTitleGrad);
         if (collection) collection->Release();
     }
@@ -841,8 +842,12 @@ static void DrawChevron(float cx, float cy, float size, float angle, D2D1_COLOR_
 
 static void DrawSearchIcon(float cx, float cy, float size, D2D1_COLOR_F c)
 {
-    Ring(cx, cy, size * 0.46f, c, 1.5f);
-    Line(cx + size * 0.32f, cy + size * 0.32f, cx + size * 0.74f, cy + size * 0.74f, c, 1.8f);
+    // 简洁的单手柄放大镜，避免双线造成“图标有瑕疵”的观感
+    float ox = cx - size * 0.08f;
+    float oy = cy - size * 0.08f;
+    Ring(ox, oy, size * 0.43f, c, 1.5f);
+    Line(ox + size * 0.31f, oy + size * 0.31f,
+        ox + size * 0.66f, oy + size * 0.66f, c, 1.6f);
 }
 
 static void DrawBookIcon(float x, float y, float size, D2D1_COLOR_F c)
@@ -998,6 +1003,7 @@ static void ResetLibraryState()
 {
     g_searchText.clear();
     g_searchFocused = g_filterOpen = false;
+    g_caretTime = 0.0f;
     g_searchFocusT = g_searchFocusVel = g_filterOpenT = g_filterOpenVel = 0;
     g_formFilter = -1;
     g_seriesFilter.clear();
@@ -1182,8 +1188,13 @@ static void BuildSideRows(std::vector<SideRow>& rows, float& contentHeight)
                 float top = y + ii * SideItemHeight();
                 float bottom = top + SideItemHeight();
                 if (top + 1.0f >= clipBottom) break;
+
+                // 展开/收起动画进行到一半时，后面的分组标题会紧跟在
+                // itemsH 后面。这里把当前行也裁到 itemsH，避免行内
+                // 图标/文字/计数压到下一个分组标题上。
+                float visibleBottom = std::min(bottom, clipBottom);
                 rows.push_back({ gi, ii, false,
-                    D2D1::RectF(PANEL_L + 28.0f, top, SIDEBAR_R - 14.0f, bottom) });
+                    D2D1::RectF(PANEL_L + 28.0f, top, SIDEBAR_R - 14.0f, visibleBottom) });
             }
         }
         y += itemsH;
@@ -1234,6 +1245,10 @@ static void UpdateAnimation(float dt)
     // 搜索框 focus
     g_searchFocusT = SmoothDamp(g_searchFocusT, g_searchFocused ? 1.0f : 0.0f,
         g_searchFocusVel, 0.09f, dt);
+    if (g_searchFocused)
+        g_caretTime += dt;
+    else
+        g_caretTime = 0.0f;
 
     // 筛选面板
     g_filterOpenT = SmoothDamp(g_filterOpenT, g_filterOpen ? 1.0f : 0.0f,
@@ -1532,21 +1547,21 @@ static void DrawHome()
         if (titleIn < 0.999f)
         {
             PushLayer(titleIn);
-            TextBrush(L"CoreBase", g_fonts.homeTitle,
+            TextBrush(L"Welcome to use CoreBase", g_fonts.homeTitle,
                 D2D1::RectF(0.0f, 144.0f, DESIGN_W, 232.0f), g_homeTitleGrad,
                 DWRITE_TEXT_ALIGNMENT_CENTER);
             PopLayer();
         }
         else
         {
-            TextBrush(L"CoreBase", g_fonts.homeTitle,
+            TextBrush(L"Welcome to use CoreBase", g_fonts.homeTitle,
                 D2D1::RectF(0.0f, 144.0f, DESIGN_W, 232.0f), g_homeTitleGrad,
                 DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     }
     else
     {
-        Text(L"CoreBase", g_fonts.homeTitle,
+        Text(L"Welcome to use CoreBase", g_fonts.homeTitle,
             D2D1::RectF(0.0f, 144.0f, DESIGN_W, 232.0f),
             Col(225, 240, 255, (int)(255 * titleIn)),
             DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1706,6 +1721,12 @@ static void DrawSidebar()
             const auto& item = group.items[row.item].first;
             bool selected = (g_seriesFilter == item && g_seriesForm == group.form);
 
+            // 分组展开到一半时，行高可能小于 SideItemHeight()。
+            // 只有这种“半行”状态需要额外裁剪，防止图标和文字越界。
+            bool partialRow = (row.rect.bottom - row.rect.top) < SideItemHeight() - 0.5f;
+            if (partialRow)
+                g_rt->PushAxisAlignedClip(row.rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
             if (selected)
             {
                 FillRRect(D2D1::RectF(row.rect.left - 1.0f, row.rect.top + 1.0f,
@@ -1735,6 +1756,9 @@ static void DrawSidebar()
                 itemColor);
             Text(std::to_wstring(group.items[row.item].second), g_fonts.tag,
                 {row.rect.right - 39, row.rect.top + 4, row.rect.right - 4, row.rect.bottom}, Accent(), DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+            if (partialRow)
+                g_rt->PopAxisAlignedClip();
         }
     }
 
@@ -1796,17 +1820,23 @@ static void DrawHeader()
             Col(96, 239, 142, (int)(11 * std::max(focus, g_searchHoverT * 0.4f))), 4.0f);
     }
 
-    DrawSearchIcon(1113.0f, 122.0f, 16.0f, Col(137, 148, 170));
-    Line(1126.0f, 135.0f, 1132.0f, 141.0f, Col(137, 148, 170), 1.0f);
+    DrawSearchIcon(1114.0f, 121.5f, 16.0f, Col(137, 148, 170));
 
     const float textX = 1141.0f;
     const float textW = 192.0f;
     if (g_searchText.empty())
     {
-        Text(L"搜索型号、系列或规格…", g_fonts.search,
-            D2D1::RectF(textX, 107.0f, textX + textW, 139.0f),
-            Col(102, 112, 134), DWRITE_TEXT_ALIGNMENT_LEADING,
-            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        if (!g_searchFocused)
+        {
+            Text(L"搜索型号、系列或规格…", g_fonts.search,
+                D2D1::RectF(textX, 107.0f, textX + textW, 139.0f),
+                Col(102, 112, 134), DWRITE_TEXT_ALIGNMENT_LEADING,
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        else if (std::fmod(g_caretTime, 1.05f) < 0.58f)
+        {
+            Line(textX + 1.0f, 111.0f, textX + 1.0f, 133.0f, Accent(), 1.4f);
+        }
     }
     else
     {
@@ -1823,7 +1853,7 @@ static void DrawHeader()
             g_rt->DrawTextLayout(D2D1::Point2F(textX, 109.0f), layout, g_solid,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-            if (g_searchFocused && std::fmod(g_time, 1.05f) < 0.58f)
+            if (g_searchFocused && std::fmod(g_caretTime, 1.05f) < 0.58f)
             {
                 DWRITE_TEXT_METRICS metrics{};
                 layout->GetMetrics(&metrics);
@@ -2350,12 +2380,19 @@ static void ClearSearchFocus()
     g_searchFocused = false;
 }
 
+static void FocusSearch()
+{
+    g_searchFocused = true;
+    g_caretTime = 0.0f;       // 点击后立刻显示光标，不再等随机闪烁相位
+}
+
 static void AppendSearch(wchar_t ch)
 {
     if (ch < 32 || ch == 127) return;
-    if (!g_searchFocused) g_searchFocused = true;
+    if (!g_searchFocused) FocusSearch();
     if (g_searchText.size() >= 40) return;
     g_searchText.push_back(ch);
+    g_caretTime = 0.0f;
     g_filterOpen = false;
     ApplyFilters();
     StartAnimation();
@@ -2392,9 +2429,10 @@ static void PasteToSearch()
             GlobalUnlock(handle);
             if (!value.empty())
             {
-                if (!g_searchFocused) g_searchFocused = true;
+                if (!g_searchFocused) FocusSearch();
                 g_searchText += value;
                 if (g_searchText.size() > 40) g_searchText.resize(40);
+                g_caretTime = 0.0f;
                 g_filterOpen = false;
                 ApplyFilters();
                 StartAnimation();
@@ -2509,11 +2547,11 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
         {
             g_searchText.clear();
             ApplyFilters();
-            g_searchFocused = true;
+            FocusSearch();
             StartAnimation();
             return;
         }
-        g_searchFocused = true;
+        FocusSearch();
         g_filterOpen = false;
         StartAnimation();
         return;
@@ -2523,7 +2561,7 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
     {
         g_searchText.clear();
         ApplyFilters();
-        g_searchFocused = true;
+        FocusSearch();
         StartAnimation();
         return;
     }
@@ -2813,7 +2851,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (ch >= 32)
         {
-            if (!g_searchFocused) g_searchFocused = true;
+            if (!g_searchFocused) FocusSearch();
             AppendSearch(ch);
         }
         break;
@@ -2824,7 +2862,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (g_detail >= 0) break;
         if (g_page == Page::Library && !g_navActive)
         {
-            if (!g_searchFocused) g_searchFocused = true;
+            if (!g_searchFocused) FocusSearch();
             AppendSearch((wchar_t)wParam);
         }
         break;
@@ -2863,7 +2901,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             if (g_page == Page::Library && !g_navActive)
             {
-                g_searchFocused = true;
+                FocusSearch();
                 g_filterOpen = false;
                 StartAnimation();
             }
