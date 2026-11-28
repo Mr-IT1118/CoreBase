@@ -159,6 +159,8 @@ struct Fonts
     IDWriteTextFormat* emptyTitle = nullptr;
     IDWriteTextFormat* emptyBody = nullptr;
     IDWriteTextFormat* watermark = nullptr;
+    IDWriteTextFormat* detailLabel = nullptr;
+    IDWriteTextFormat* detailValue = nullptr;
 };
 
 // ============================================================================
@@ -236,11 +238,18 @@ static std::vector<int> g_slots;
 static int g_hoverCard = -1;
 static int g_detail = -1;
 static float g_detailScroll = 0, g_detailMax = 0;
+static float g_detailT = 0, g_detailVel = 0;
+static bool g_detailClosing = false;
 static bool g_dragGrid = false;
 static float g_dragOffset = 0;
 static float g_gridScroll = 0, g_gridTarget = 0, g_gridVel = 0, g_gridMax = 0;
+static float g_gridReveal = 1.0f, g_gridRevealVel = 0.0f;
+static int g_gridRevealDir = 1;   // 1: 向下，-1: 向上
 static const D2D1_RECT_F gridView{ CONTENT_L - 8, GRID_TOP - 5, CONTENT_R + 8, FOOTER_LINE_Y - 12 };
-static const D2D1_RECT_F gpuTab{742,101,839,143}, cpuTab{853,101,953,143}, syncButton{970,101,1077,143};
+static const D2D1_RECT_F leftTab{742,101,839,143}, rightTab{853,101,953,143}, syncButton{970,101,1077,143};
+static bool CpuFirst() { return g_brand != 0; }   // Intel / AMD 把 CPU 放在前面
+static D2D1_RECT_F GpuTabRect() { return CpuFirst() ? rightTab : leftTab; }
+static D2D1_RECT_F CpuTabRect() { return CpuFirst() ? leftTab : rightTab; }
 static const D2D1_RECT_F detailPanel{295,72,1305,832}, closeButton{1200,92,1270,130}, sourceButton{1080,770,1270,810};
 static bool g_syncBusy = false, g_closing = false;
 static corebase::detail::Handle g_cancel;
@@ -248,7 +257,12 @@ static std::thread g_worker;
 static corebase::SyncResult g_result;
 static constexpr UINT SyncComplete = WM_APP + 1;
 static D2D1_COLOR_F Accent() { return g_brands[g_brand].accent; }
-static float SideItemHeight() { return g_cpu ? 46.0f : 27.0f; }
+static float SideItemHeight()
+{
+    if (!g_cpu) return 27.0f;
+    // CPU 系列已经分组精简成单行，所有 CPU 品牌统一用更紧凑的行距
+    return 36.0f;
+}
 static int g_visibleCount = 0;
 static float g_emptyT = 0.0f;
 static float g_emptyTarget = 0.0f;
@@ -283,6 +297,7 @@ static int g_filterHover = -1;
 static int g_formFilter = -1;
 static const wchar_t* forms[] = { L"Desktop", L"Mobile", L"Workstation" };
 static const wchar_t* formLabels[] = { L"桌面端 Desktop", L"移动端 Mobile", L"工作站 Workstation" };
+static const wchar_t* formNames[] = { L"桌面端", L"移动端", L"工作站" };
 
 // 顶栏按钮
 static D2D1_RECT_F g_backRect{ 404.0f, 100.0f, 438.0f, 134.0f };
@@ -491,6 +506,8 @@ static void CreateFonts()
     g_fonts.emptyTitle = MakeTextFormat(20.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     g_fonts.emptyBody = MakeTextFormat(12.5f, DWRITE_FONT_WEIGHT_NORMAL);
     g_fonts.watermark = MakeTextFormat(230.0f, DWRITE_FONT_WEIGHT_BOLD);
+    g_fonts.detailLabel = MakeTextFormat(12.0f, DWRITE_FONT_WEIGHT_NORMAL);
+    g_fonts.detailValue = MakeTextFormat(19.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
 }
 
 static void DestroyFonts()
@@ -502,7 +519,8 @@ static void DestroyFonts()
         &g_fonts.footer, &g_fonts.footerBold, &g_fonts.homeTitle,
         &g_fonts.homeKicker, &g_fonts.brand, &g_fonts.brandMeta,
         &g_fonts.homeFooter, &g_fonts.toast, &g_fonts.emptyTitle,
-        &g_fonts.emptyBody, &g_fonts.watermark
+        &g_fonts.emptyBody, &g_fonts.watermark, &g_fonts.detailLabel,
+        &g_fonts.detailValue
     };
     for (auto* p : formats)
     {
@@ -913,6 +931,152 @@ static std::wstring Series(const corebase::HardwareItem& item)
 {
     return item.series.empty() ? L"其他系列" : item.series;
 }
+
+static std::wstring ReplaceAll(std::wstring text, const std::wstring& from, const std::wstring& to)
+{
+    if (from.empty()) return text;
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::wstring::npos)
+    {
+        text.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return text;
+}
+
+// Intel 官方系列名很长，侧栏只显示简洁的中文名称。
+static std::wstring SimplifyIntelCpuSeries(const std::wstring& raw)
+{
+    if (raw.empty()) return L"其他系列";
+    const std::wstring lower = Lower(raw);
+    auto digitsBefore = [&](size_t end) {
+        size_t begin = end;
+        while (begin > 0 && std::iswdigit(lower[begin - 1])) --begin;
+        return std::make_pair(begin, end);
+    };
+
+    // 10th Generation Intel Core i3/i5/i7/i9 -> 10代酷睿系列
+    size_t genEnd = 0;
+    while (genEnd < lower.size() && std::iswdigit(lower[genEnd])) ++genEnd;
+    if (genEnd > 0 && lower.find(L"generation", genEnd) != std::wstring::npos &&
+        lower.find(L"core", genEnd) != std::wstring::npos)
+        return raw.substr(0, genEnd) + L"代酷睿系列";
+
+    // Intel Core i5 Processors (14th gen) -> 14代酷睿系列
+    size_t thGen = lower.find(L"th gen");
+    if (thGen != std::wstring::npos)
+    {
+        auto bounds = digitsBefore(thGen);
+        if (bounds.first < bounds.second)
+            return raw.substr(bounds.first, bounds.second - bounds.first) + L"代酷睿系列";
+    }
+
+    // Intel Core Ultra ... -> 酷睿 Ultra 系列
+    if (lower.find(L"core ultra") != std::wstring::npos) return L"酷睿 Ultra 系列";
+
+    if (lower.find(L"core x-series") != std::wstring::npos) return L"酷睿 X 系列";
+    if (lower.find(L"core processor n-series") != std::wstring::npos) return L"酷睿 N 系列";
+    if (lower.find(L"arc g3") != std::wstring::npos) return L"锐炫系列";
+
+    if (lower.find(L"core processors") != std::wstring::npos) return L"酷睿系列";
+    if (lower.find(L"core i") != std::wstring::npos ||
+        lower.find(L"core m") != std::wstring::npos) return L"酷睿系列";
+
+    if (lower.find(L"processor n-series") != std::wstring::npos) return L"N 系列";
+    if (lower.find(L"processor u-series") != std::wstring::npos) return L"U 系列";
+    if (lower.find(L"processor for desktop") != std::wstring::npos) return L"桌面处理器";
+
+    if (lower.find(L"xeon") != std::wstring::npos) return L"至强系列";
+    if (lower.find(L"celeron") != std::wstring::npos) return L"赛扬系列";
+    if (lower.find(L"pentium") != std::wstring::npos) return L"奔腾系列";
+    if (lower.find(L"atom") != std::wstring::npos) return L"凌动系列";
+
+    std::wstring text = raw;
+    text = ReplaceAll(text, L"Intel ", L"");
+    text = ReplaceAll(text, L" Processors", L"");
+    text = ReplaceAll(text, L" processors", L"");
+    text = ReplaceAll(text, L" Processor", L"");
+    text = ReplaceAll(text, L" processor", L"");
+    text = ReplaceAll(text, L"  ", L" ");
+    while (!text.empty() && text.front() == L' ') text.erase(text.begin());
+    while (!text.empty() && text.back() == L' ') text.pop_back();
+    return text.empty() ? L"其他系列" : text;
+}
+
+static std::wstring SimplifyAmdCpuSeries(const std::wstring& raw)
+{
+    if (raw.empty()) return L"其他系列";
+    const std::wstring lower = Lower(raw);
+
+    if (lower.find(L"threadripper") != std::wstring::npos) return L"线程撕裂者系列";
+    if (lower.find(L"ryzen ai") != std::wstring::npos) return L"锐龙 AI 系列";
+    if (lower.find(L"ryzen z") != std::wstring::npos) return L"锐龙 Z 系列";
+    if (lower.find(L"ryzen") != std::wstring::npos)
+    {
+        static const wchar_t* generations[] = {
+            L"9000", L"8000", L"7000", L"6000", L"5000", L"4000", L"3000", L"2000", L"1000",
+            L"400", L"300", L"200", L"100", L"10"
+        };
+        for (const wchar_t* gen : generations)
+        {
+            std::wstring needle = std::wstring(L" ") + gen + L" ";
+            if (lower.find(needle) != std::wstring::npos)
+                return std::wstring(L"锐龙 ") + gen + L" 系列";
+        }
+        return L"锐龙系列";
+    }
+
+    if (lower.find(L"athlon") != std::wstring::npos) return L"速龙系列";
+    if (lower.find(L"sempron") != std::wstring::npos) return L"闪龙系列";
+    if (lower.find(L"phenom") != std::wstring::npos) return L"羿龙系列";
+    if (lower.find(L"fx") != std::wstring::npos) return L"FX 系列";
+    if (lower.find(L"e1-series") != std::wstring::npos ||
+        lower.find(L"e2-series") != std::wstring::npos ||
+        lower.find(L"e-series") != std::wstring::npos) return L"E 系列 APU";
+    if (lower.find(L"a-series") != std::wstring::npos || lower.find(L"apu") != std::wstring::npos)
+        return L"A 系列 APU";
+    if (lower.find(L"amd 3000") != std::wstring::npos) return L"AMD 3000 系列";
+    return raw;
+}
+
+static std::wstring SeriesLabel(const corebase::HardwareItem& item)
+{
+    if (g_cpu && item.brand == L"Intel") return SimplifyIntelCpuSeries(item.series);
+    if (g_cpu && item.brand == L"AMD") return SimplifyAmdCpuSeries(item.series);
+
+    std::wstring label = Series(item);
+    label = ReplaceAll(label, L"-Series", L" 系列");
+    label = ReplaceAll(label, L"-series", L" 系列");
+    label = ReplaceAll(label, L" Series", L" 系列");
+    label = ReplaceAll(label, L" series", L" 系列");
+    label = ReplaceAll(label, L" SERIES", L" 系列");
+    return label;
+}
+
+static int SeriesSidebarOrder(const std::wstring& form, const std::wstring& series)
+{
+    int order = 0;
+    for (const auto& group : g_sideGroups)
+    {
+        for (const auto& item : group.items)
+        {
+            if (group.form == form && item.first == series) return order;
+            ++order;
+        }
+    }
+    return -1;
+}
+
+static int SidebarSeriesOrder(const std::wstring& label)
+{
+    size_t i = 0;
+    while (i < label.size() && !std::iswdigit(label[i])) ++i;
+    if (i == label.size()) return 100000;
+    int number = 0;
+    while (i < label.size() && std::iswdigit(label[i]) && number < 1000000)
+        number = number * 10 + (label[i++] - L'0');
+    return number;
+}
 static bool ReloadCatalog()
 {
     bool ok = corebase::LoadCatalogFromDb(g_catalog, g_dbError);
@@ -934,7 +1098,9 @@ static void InitData()
     g_brands[2] = { L"Intel", {}, 2, Col(104,183,255), HomeCardRect(2) };
     ReloadCatalog();
 }
-static void ApplyFilters()
+static void StartAnimation();
+
+static void ApplyFilters(bool animate = true, int direction = 1)
 {
     g_slots.clear();
     auto needle = Lower(g_searchText);
@@ -943,7 +1109,7 @@ static void ApplyFilters()
         auto& card = g_cards[i];
         const auto& item = *card.item;
         card.hover = card.hoverVel = 0;
-        if (!g_seriesFilter.empty() && (Series(item) != g_seriesFilter || item.form_factor != g_seriesForm)) continue;
+        if (!g_seriesFilter.empty() && (SeriesLabel(item) != g_seriesFilter || item.form_factor != g_seriesForm)) continue;
         if (g_formFilter >= 0 && item.form_factor != forms[g_formFilter]) continue;
         if (card.search.find(needle) != std::wstring::npos) g_slots.push_back(i);
     }
@@ -953,6 +1119,17 @@ static void ApplyFilters()
     g_gridScroll = g_gridTarget = g_gridVel = 0;
     g_emptyTarget = g_slots.empty() ? 1.0f : 0.0f;
     g_hoverCard = g_detail = -1;
+    g_detailT = g_detailVel = 0;
+    g_detailClosing = false;
+
+    // 切换系列 / 形态 / 品牌时，卡片淡入，并按导航方向轻微滑动。
+    if (animate)
+    {
+        g_gridReveal = 0.0f;
+        g_gridRevealVel = 0.0f;
+        g_gridRevealDir = direction;
+        StartAnimation();
+    }
 }
 static void RebuildLibrary()
 {
@@ -968,7 +1145,7 @@ static void RebuildLibrary()
             for (const auto& f : corebase::commonFields) append(f);
             for (const auto& f : fields) append(f);
             g_cards.push_back({&item, Lower(std::move(search)), Summary(item)});
-            ++grouped[item.form_factor][Series(item)];
+            ++grouped[item.form_factor][SeriesLabel(item)];
         }
     };
     if (g_cpu) add(g_catalog.cpus, corebase::cpuFields);
@@ -979,9 +1156,18 @@ static void RebuildLibrary()
         auto group = grouped.find(forms[i]);
         if (group == grouped.end()) continue;
         SideGroup side;
-        side.title = formLabels[i];
+        side.title = g_cpu ? formNames[i] : formLabels[i];
         side.form = forms[i];
         side.items.assign(group->second.begin(), group->second.end());
+        if (g_cpu)
+        {
+            std::stable_sort(side.items.begin(), side.items.end(),
+                [](const auto& a, const auto& b) {
+                    int oa = SidebarSeriesOrder(a.first);
+                    int ob = SidebarSeriesOrder(b.first);
+                    return oa != ob ? oa < ob : a.first < b.first;
+                });
+        }
         side.expanded = true;
         side.expand = side.expandTarget = 1;
         g_sideGroups.push_back(std::move(side));
@@ -1114,7 +1300,9 @@ static void UpdateHoverTargets()
 
     if (g_detail >= 0)
     {
-        g_handCursor = InRect(closeButton, g_mouse) || (g_cards[g_detail].item->source_url.rfind(L"https://",0) == 0 && InRect(sourceButton, g_mouse));
+        if (!g_detailClosing)
+            g_handCursor = InRect(closeButton, g_mouse) ||
+                (g_cards[g_detail].item->source_url.rfind(L"https://",0) == 0 && InRect(sourceButton, g_mouse));
         return;
     }
     if (g_filterOpen)
@@ -1160,7 +1348,7 @@ static void UpdateHoverTargets()
 
     g_hoverCard = CardAt(g_mouse);
     g_handCursor =
-        InRect(gpuTab,g_mouse) || (g_brand != 0 && InRect(cpuTab,g_mouse)) || (!g_syncBusy && InRect(syncButton,g_mouse)) ||
+        InRect(GpuTabRect(),g_mouse) || (g_brand != 0 && InRect(CpuTabRect(),g_mouse)) || (!g_syncBusy && InRect(syncButton,g_mouse)) ||
         InRect(g_backRect, g_mouse) || InRect(g_searchRect, g_mouse) ||
         InRect(g_filterRect, g_mouse) ||
         (!g_searchText.empty() && InRect(SearchClearRect(), g_mouse)) ||
@@ -1259,6 +1447,19 @@ static void UpdateAnimation(float dt)
         group.expand = SmoothDamp(group.expand, group.expandTarget,
             group.expandVel, 0.13f, dt);
 
+    // 详情面板的开合过渡
+    if (g_detail >= 0)
+    {
+        g_detailT = SmoothDamp(g_detailT, g_detailClosing ? 0.0f : 1.0f,
+            g_detailVel, 0.13f, dt);
+        if (g_detailClosing && g_detailT < 0.015f)
+        {
+            g_detail = -1;
+            g_detailClosing = false;
+            g_detailT = g_detailVel = 0.0f;
+        }
+    }
+
     float contentH = 0.0f;
     {
         std::vector<SideRow> rows;
@@ -1275,6 +1476,8 @@ static void UpdateAnimation(float dt)
 
     g_gridScroll = SmoothDamp(g_gridScroll, g_gridTarget, g_gridVel, 0.10f, dt);
     if (std::abs(g_gridScroll - g_gridTarget) < 0.05f) { g_gridScroll = g_gridTarget; g_gridVel = 0; }
+    g_gridReveal = SmoothDamp(g_gridReveal, 1.0f, g_gridRevealVel, 0.16f, dt);
+    if (g_gridReveal > 0.999f) g_gridReveal = 1.0f;
     g_hoverCard = (g_page == Page::Library && !g_navActive && !g_filterOpen && g_detail < 0) ? CardAt(g_mouse) : -1;
     for (int slot = FirstSlot(); slot < EndSlot(); ++slot)
     {
@@ -1319,6 +1522,7 @@ static bool NeedsContinuousFrames()
     }
     if (!Nearly(g_filterOpenT, g_filterOpen ? 1.0f : 0.0f, 0.004f)) return true;
     if (!Nearly(g_searchFocusT, g_searchFocused ? 1.0f : 0.0f, 0.004f)) return true;
+    if (g_detail >= 0 && !Nearly(g_detailT, g_detailClosing ? 0.0f : 1.0f, 0.004f)) return true;
     if (!Nearly(g_sideScroll, g_sideScrollTarget, 0.05f)) return true;
     if (!Nearly(g_emptyT, g_emptyTarget, 0.004f)) return true;
 
@@ -1327,6 +1531,7 @@ static bool NeedsContinuousFrames()
         if (!Nearly(g_homeHoverV[i], g_homeHoverTarget[i], 0.004f)) return true;
     }
     if (!Nearly(g_gridScroll, g_gridTarget, 0.05f) || g_hoverCard >= 0) return true;
+    if (!Nearly(g_gridReveal, 1.0f, 0.004f)) return true;
     for (int slot = FirstSlot(); slot < EndSlot(); ++slot)
         if (g_cards[g_slots[slot]].hover > 0.004f) return true;
 
@@ -1794,8 +1999,8 @@ static void DrawHeader()
         {CONTENT_L,86,742,145}, Accent());
     Text(brand.name + (g_cpu ? L"  /  CPU" : L"  /  GPU") + L"     " + g_syncStatus,
         g_fonts.subtitle, {CONTENT_L,151,CONTENT_R,180}, Col(159,170,191));
-    Button(gpuTab, L"显卡 GPU", !g_cpu);
-    Button(cpuTab, L"处理器 CPU", g_cpu, g_brand == 0);
+    Button(GpuTabRect(), L"显卡 GPU", !g_cpu);
+    Button(CpuTabRect(), L"处理器 CPU", g_cpu, g_brand == 0);
     Button(syncButton, g_syncBusy ? L"正在同步…" : L"同步数据", false, g_syncBusy);
 
     // ===== 搜索框 =====
@@ -2023,7 +2228,30 @@ static void DrawCard(int slot)
     const auto& card = g_cards[g_slots[slot]];
     auto box = CardSlotRect(slot);
     auto accent = Accent();
-    float enter = CardEnter(slot), x = box.left, y = box.top;
+
+    // 切换系列/形态时，新结果按行列轻微错峰淡入并上浮。
+    float delay = std::min(0.28f, (slot % 6) * 0.035f + (slot / 6) * 0.015f);
+    float local = Clamp01((g_gridReveal - delay) / std::max(0.01f, 1.0f - delay));
+    float enter = CardEnter(slot) * EaseOutCubic(local);
+    if (enter <= 0.001f) return;
+
+    float x = box.left, y = box.top;
+    D2D1_MATRIX_3X2_F saved{};
+    if (enter < 0.999f)
+    {
+        g_rt->GetTransform(&saved);
+        float cx = (box.left + box.right) * 0.5f;
+        float cy = (box.top + box.bottom) * 0.5f;
+        float scale = 0.97f + 0.03f * enter;
+        float slideY = -static_cast<float>(g_gridRevealDir) * (1.0f - enter) * 20.0f;
+        D2D1::Matrix3x2F cardT =
+            D2D1::Matrix3x2F::Translation(0.0f, slideY) *
+            D2D1::Matrix3x2F::Translation(cx, cy) *
+            D2D1::Matrix3x2F::Scale(scale, scale) *
+            D2D1::Matrix3x2F::Translation(-cx, -cy);
+        g_rt->SetTransform(cardT * saved);
+    }
+
     if (enter < 1) PushLayer(enter);
     FillRRect(box, 14, Col(22,28,43));
     StrokeRRect(box, 14, card.hover > 0.01f ? Alpha(accent,0.25f + 0.65f * card.hover) : Col(51,61,81), 1.2f);
@@ -2039,45 +2267,90 @@ static void DrawCard(int slot)
         Text(card.specs[i].second, g_fonts.specValue, {x+142,top+15,box.right-6,top+42},Col(231,239,250));
     }
     if (enter < 1) PopLayer();
+    if (enter < 0.999f) g_rt->SetTransform(saved);
 }
 
-struct DetailRow
+struct DetailTile
 {
     std::wstring label, value;
-    float top, height;
 };
-static std::vector<DetailRow> g_detailRows;
-static constexpr float detailTop = 167, detailBottom = 749, valueLeft = 526, valueRight = 1260;
+static std::vector<DetailTile> g_detailTiles;
+static constexpr float detailGridTop = 178.0f;
+static constexpr float detailGridBottom = 742.0f;
+static constexpr float detailGridLeft = 325.0f;
+static constexpr float detailGridRight = 1275.0f;
+static constexpr float detailTileGap = 14.0f;
+static constexpr float detailTileH = 98.0f;
+
+// 详情页先展示最关键的规格，再展示其余数据。
+static int DetailRank(const std::wstring& label)
+{
+    static const wchar_t* cpuOrder[] = {
+        L"核心数", L"线程数", L"基础频率", L"加速频率", L"L3 缓存", L"最大睿频功耗",
+        L"TDP", L"插槽", L"P 核", L"E 核", L"L2 缓存", L"内存支持", L"PCIe 版本",
+        L"集成显卡", L"系列", L"形态", L"架构", L"发布年份"
+    };
+    static const wchar_t* gpuOrder[] = {
+        L"显存容量", L"显存类型", L"显存位宽", L"显存带宽", L"TDP", L"加速频率",
+        L"基础频率", L"推荐电源", L"计算单元", L"计算单元类型", L"PCIe 接口",
+        L"系列", L"形态", L"架构", L"发布年份"
+    };
+    const wchar_t* const* order = g_cpu ? cpuOrder : gpuOrder;
+    int count = g_cpu ? static_cast<int>(ARRAYSIZE(cpuOrder)) : static_cast<int>(ARRAYSIZE(gpuOrder));
+    for (int i = 0; i < count; ++i)
+        if (label == order[i]) return i;
+    return 100;
+}
+
 static void OpenDetail(int index)
 {
+    if (index < 0 || index >= static_cast<int>(g_cards.size())) return;
+
     g_detail = index;
-    g_detailScroll = 0;
-    g_detailRows.clear();
-    float top = 0;
+    g_detailClosing = false;
+    g_detailT = 0.0f;
+    g_detailVel = 0.0f;
+    g_detailScroll = 0.0f;
+    g_detailTiles.clear();
+
     auto& item = *g_cards[index].item;
     auto append = [&](const auto& row, const auto& field) {
-        auto value = Value(row.*field.member, field.unit);
-        auto font = g_fonts.search;
-        font->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        IDWriteTextLayout* layout = nullptr;
-        float height = 35;
-        if (SUCCEEDED(g_dwrite->CreateTextLayout(value.data(), static_cast<UINT32>(value.size()),
-            font, valueRight-valueLeft, 20000, &layout)))
-        {
-            DWRITE_TEXT_METRICS metrics{};
-            layout->GetMetrics(&metrics);
-            height = std::max(height, metrics.height + 14);
-            layout->Release();
-        }
-        g_detailRows.push_back({field.label,std::move(value),top,height});
-        top += height;
+        std::wstring label = field.label;
+        if (label == L"型号" || label == L"品牌" || label == L"来源网址" ||
+            label == L"产品 ID" || label == L"首次入库" || label == L"更新于")
+            return;
+
+        std::wstring value = Value(row.*field.member, field.unit);
+        if (label == L"系列")
+            value = SeriesLabel(item);
+
+        // 空白的次要参数直接隐藏，详情页更清爽；主要参数保留 -- 占位。
+        if (value == L"--" && DetailRank(label) >= 6) return;
+        g_detailTiles.push_back({ std::move(label), std::move(value) });
     };
     if (g_cpu)
         for (auto& f : corebase::cpuFields) append(static_cast<const corebase::CpuItem&>(item), f);
     else
         for (auto& f : corebase::gpuFields) append(static_cast<const corebase::GpuItem&>(item), f);
     for (auto& f : corebase::commonFields) append(item, f);
-    g_detailMax = std::max(0.0f, top - (detailBottom-detailTop));
+
+    std::stable_sort(g_detailTiles.begin(), g_detailTiles.end(),
+        [](const DetailTile& a, const DetailTile& b) {
+            return DetailRank(a.label) < DetailRank(b.label);
+        });
+
+    int rows = (static_cast<int>(g_detailTiles.size()) + 2) / 3;
+    float contentH = rows > 0 ? rows * detailTileH + (rows - 1) * detailTileGap : 0.0f;
+    g_detailMax = std::max(0.0f, contentH - (detailGridBottom - detailGridTop));
+    g_detailScroll = 0.0f;
+    StartAnimation();
+}
+
+static void CloseDetail()
+{
+    if (g_detail < 0 || g_detailClosing) return;
+    g_detailClosing = true;
+    StartAnimation();
 }
 static bool HasSource()
 {
@@ -2110,25 +2383,81 @@ static void Scrollbar(float x, float top, float bottom, float offset, float maxO
 }
 static void DrawDetail()
 {
-    FillRect({0,0,DESIGN_W,DESIGN_H}, Col(2,5,11,183));
-    FillRRect(detailPanel,18,Col(21,28,43,250));
-    StrokeRRect(detailPanel,18,Alpha(Accent(),0.5f),1);
-    Text(g_brands[g_brand].name + (g_cpu ? L"  /  CPU 参数" : L"  /  GPU 参数"),g_fonts.tag,{325,90,1180,112},Accent());
-    Wrapped(g_cards[g_detail].item->model,g_fonts.cardTitle,{325,113,1180,166},Col(239,244,252));
-    Button(closeButton,L"关闭 ×");
-    g_rt->PushAxisAlignedClip({320,detailTop,1280,detailBottom},D2D1_ANTIALIAS_MODE_ALIASED);
-    for (const auto& row : g_detailRows)
+    if (g_detail < 0) return;
+
+    float raw = Clamp01(g_detailT);
+    float a = raw * raw * (3.0f - 2.0f * raw);
+    if (a <= 0.002f) return;
+
+    // 背景遮罩淡入
+    FillRect({ 0,0,DESIGN_W,DESIGN_H }, Col(2, 5, 11, static_cast<int>(183 * a)));
+
+    D2D1_MATRIX_3X2_F saved{};
+    g_rt->GetTransform(&saved);
+    float cx = (detailPanel.left + detailPanel.right) * 0.5f;
+    float cy = (detailPanel.top + detailPanel.bottom) * 0.5f;
+    float scale = 0.965f + 0.035f * a;
+    D2D1::Matrix3x2F panelT =
+        D2D1::Matrix3x2F::Translation(0.0f, (1.0f - a) * 18.0f) *
+        D2D1::Matrix3x2F::Translation(cx, cy) *
+        D2D1::Matrix3x2F::Scale(scale, scale) *
+        D2D1::Matrix3x2F::Translation(-cx, -cy);
+    g_rt->SetTransform(panelT * saved);
+
+    bool useLayer = a < 0.999f;
+    if (useLayer) PushLayer(a);
+
+    // 面板阴影
+    FillRRect(detailPanel.left + 4, detailPanel.top + 10, detailPanel.right + 4,
+        detailPanel.bottom + 12, 20, Col(0, 0, 0, 115));
+    FillRRect(detailPanel, 18, Col(21, 28, 43, 250));
+    StrokeRRect(detailPanel, 18, Alpha(Accent(), 0.5f), 1);
+
+    auto& item = *g_cards[g_detail].item;
+    Text(g_brands[g_brand].name + (g_cpu ? L"  /  CPU 参数" : L"  /  GPU 参数"),
+        g_fonts.tag, { 325,90,900,112 }, Accent());
+    Text(item.form_factor, g_fonts.tag, { 920,90,1175,112 }, Col(142, 156, 178),
+        DWRITE_TEXT_ALIGNMENT_TRAILING);
+    Wrapped(item.model, g_fonts.cardTitle, { 325,112,1170,166 }, Col(239, 244, 252));
+    Button(closeButton, L"关闭 ×");
+
+    // 标题下分隔线
+    Line(325, 168, 1275, 168, Col(255, 255, 255, 18), 1);
+
+    // 参数网格
+    g_rt->PushAxisAlignedClip({ detailGridLeft,detailGridTop,detailGridRight,detailGridBottom },
+        D2D1_ANTIALIAS_MODE_ALIASED);
+    float tileW = (detailGridRight - detailGridLeft - 2.0f * detailTileGap) / 3.0f;
+    for (int i = 0; i < static_cast<int>(g_detailTiles.size()); ++i)
     {
-        float y = detailTop + row.top - g_detailScroll;
-        if (y + row.height <= detailTop || y >= detailBottom) continue;
-        Text(row.label,g_fonts.search,{325,y+6,valueLeft-15,y+row.height},Col(153,167,190));
-        Wrapped(row.value,g_fonts.search,{valueLeft,y+6,valueRight,y+row.height},Col(231,238,247));
-        Line(325,y+row.height-1,valueRight,y+row.height-1,Col(255,255,255,15),1);
+        int col = i % 3;
+        int row = i / 3;
+        float x = detailGridLeft + col * (tileW + detailTileGap);
+        float y = detailGridTop + row * (detailTileH + detailTileGap) - g_detailScroll;
+        if (y + detailTileH < detailGridTop || y > detailGridBottom) continue;
+
+        bool primary = i < 6;
+        D2D1_RECT_F tile = { x,y,x + tileW,y + detailTileH };
+        FillRRect(tile, 10, primary ? Col(26, 35, 51, 242) : Col(20, 26, 40, 225));
+        StrokeRRect(tile, 10, primary ? Alpha(Accent(), 0.34f) : Col(48, 57, 76, 170), 1.0f);
+        if (primary)
+            FillRRect(x + 1, y + 14, x + 3, y + detailTileH - 14, 1, Alpha(Accent(), 0.8f));
+
+        Text(g_detailTiles[i].label, g_fonts.detailLabel,
+            { x + 16,y + 12,x + tileW - 14,y + 34 },
+            primary ? Accent() : Col(137, 150, 173));
+        Wrapped(g_detailTiles[i].value, g_fonts.detailValue,
+            { x + 16,y + 34,x + tileW - 14,y + detailTileH - 10 }, Col(236, 242, 252));
     }
     g_rt->PopAxisAlignedClip();
-    Scrollbar(1282,detailTop,detailBottom,g_detailScroll,g_detailMax);
-    if (HasSource()) Button(sourceButton,L"查看官网来源  ↗",true);
-    Text(L"滚轮翻阅参数",g_fonts.footer,{325,781,700,810},Col(148,160,180));
+
+    Scrollbar(1282, detailGridTop, detailGridBottom, g_detailScroll, g_detailMax);
+    if (HasSource()) Button(sourceButton, L"查看官网来源  ↗", true);
+    Text(L"滚轮翻阅参数  ·  ESC 关闭", g_fonts.footer,
+        { 325,781,760,810 }, Col(148, 160, 180));
+
+    if (useLayer) PopLayer();
+    g_rt->SetTransform(saved);
 }
 
 static void DrawEmptyState()
@@ -2394,7 +2723,7 @@ static void AppendSearch(wchar_t ch)
     g_searchText.push_back(ch);
     g_caretTime = 0.0f;
     g_filterOpen = false;
-    ApplyFilters();
+    ApplyFilters(false);
     StartAnimation();
 }
 
@@ -2408,7 +2737,7 @@ static void BackspaceSearch()
         wchar_t prev = g_searchText.back();
         if (prev >= 0xD800 && prev <= 0xDBFF) g_searchText.pop_back();
     }
-    ApplyFilters();
+    ApplyFilters(false);
     StartAnimation();
 }
 
@@ -2434,7 +2763,7 @@ static void PasteToSearch()
                 if (g_searchText.size() > 40) g_searchText.resize(40);
                 g_caretTime = 0.0f;
                 g_filterOpen = false;
-                ApplyFilters();
+                ApplyFilters(false);
                 StartAnimation();
             }
         }
@@ -2459,10 +2788,18 @@ static void HandleSidebarClick(const SideRow& row)
 
     const auto& item = group.items[row.item].first;
     bool selected = g_seriesFilter == item && g_seriesForm == group.form;
-    g_seriesFilter = selected ? L"" : item;
-    g_seriesForm = selected ? L"" : group.form;
+    std::wstring nextFilter = selected ? L"" : item;
+    std::wstring nextForm = selected ? L"" : group.form;
+
+    // 系列在列表里往下切时，新内容向下滑入；往上切时反向滑入。
+    int oldOrder = g_seriesFilter.empty() ? -1 : SeriesSidebarOrder(g_seriesForm, g_seriesFilter);
+    int newOrder = nextFilter.empty() ? -1 : SeriesSidebarOrder(nextForm, nextFilter);
+    int direction = (oldOrder >= 0 && newOrder >= 0 && newOrder < oldOrder) ? -1 : 1;
+
+    g_seriesFilter = std::move(nextFilter);
+    g_seriesForm = std::move(nextForm);
     g_searchFocused = false;
-    ApplyFilters();
+    ApplyFilters(true, direction);
     StartAnimation();
 }
 
@@ -2491,7 +2828,8 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
 {
     if (g_detail >= 0)
     {
-        if (!InRect(detailPanel,p) || InRect(closeButton,p)) g_detail = -1;
+        if (g_detailClosing) return;
+        if (!InRect(detailPanel,p) || InRect(closeButton,p)) { CloseDetail(); return; }
         else if (InRect(sourceButton,p) && HasSource())
         {
             auto result = ShellExecuteW(g_hwnd,L"open",g_cards[g_detail].item->source_url.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
@@ -2528,9 +2866,9 @@ static void HandleLibraryClick(const D2D1_POINT_2F& p)
     }
 
     if (InRect(syncButton,p)) { StartSync(); return; }
-    if (InRect(gpuTab,p) || InRect(cpuTab,p))
+    if (InRect(GpuTabRect(),p) || InRect(CpuTabRect(),p))
     {
-        bool cpu = InRect(cpuTab,p);
+        bool cpu = InRect(CpuTabRect(),p);
         if (cpu && g_brand == 0) { ShowToast(L"NVIDIA 暂无 CPU 采集来源",Accent()); return; }
         if (cpu != g_cpu) { g_cpu = cpu; ResetLibraryState(); }
         return;
@@ -2633,7 +2971,7 @@ static void HandleClick(const D2D1_POINT_2F& p)
             if (InRect(g_brands[i].rect, p))
             {
                 g_brand = i;
-                g_cpu = false;
+                g_cpu = (i != 0);   // Intel / AMD 默认先看处理器
                 NavigateTo(Page::Library);
                 StartAnimation();
                 return;
@@ -2872,7 +3210,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     {
         if (g_detail >= 0)
         {
-            if (wParam == VK_ESCAPE) g_detail = -1;
+            if (wParam == VK_ESCAPE) CloseDetail();
             if (wParam == VK_NEXT) g_detailScroll = std::min(g_detailMax,g_detailScroll + 510);
             if (wParam == VK_PRIOR) g_detailScroll = std::max(0.0f,g_detailScroll - 510);
             StartAnimation();
