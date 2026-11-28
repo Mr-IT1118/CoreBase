@@ -889,10 +889,13 @@ static std::wstring Value(const std::wstring& raw, const std::wstring& unit = {}
 using Specs = decltype(CatalogCard::specs);
 static Specs Summary(const corebase::GpuItem& g)
 {
+    auto third = std::make_pair(L"TDP", Value(g.tdp_w, L"W"));
+    if (g.tdp_w.empty() && !g.boost_clock_mhz.empty())
+        third = {L"加速频率", Value(g.boost_clock_mhz, L"MHz")};
+    else if (g.tdp_w.empty() && !g.base_clock_mhz.empty())
+        third = {L"基础频率", Value(g.base_clock_mhz, L"MHz")};
     return {{ {L"显存", Value(g.vram_gb, L"GB") + L" " + Value(g.vram_type)},
-        {L"位宽", Value(g.bus_bits, L"bit")},
-        g.tdp_w.empty() ? std::make_pair(L"加速频率", Value(g.boost_clock_mhz, L"MHz"))
-                        : std::make_pair(L"TDP", Value(g.tdp_w, L"W")) }};
+        {L"位宽", Value(g.bus_bits, L"bit")}, third }};
 }
 static Specs Summary(const corebase::CpuItem& c)
 {

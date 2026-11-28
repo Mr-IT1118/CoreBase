@@ -208,7 +208,8 @@ class ExistingVendorTests(unittest.TestCase):
             ["Launch Date", "Q4'24"],
             ["Xe-cores", "20"],
             ["Graphics Clock", "2670 MHz"],
-            ["Total Board Power (TBP)", "190 W"],
+            ["TBP", "190 W"],
+            ["Minimum Power Supply Unit", "600 W"],
             ["Memory", "12 GB GDDR6"],
             ["Graphics Memory Interface", "192 bit"],
             ["Graphics Memory Bandwidth", "456 GB/s"],
@@ -218,6 +219,7 @@ class ExistingVendorTests(unittest.TestCase):
         self.assertEqual(b580["architecture"], "Xe2")
         self.assertEqual((b580["compute_units"], b580["compute_unit_type"]), (20, "Xe-Cores"))
         self.assertEqual((b580["base_clock_mhz"], b580["tdp_w"], b580["release_year"]), (2670, 190, 2024))
+        self.assertEqual(b580["recommended_psu_w"], 600)
         self.assertEqual((b580["bandwidth_gbps"], b580["pcie_interface"]), (456.0, "PCI Express 4.0 x8"))
 
     def test_extended_specs_persist_to_database(self):
@@ -228,6 +230,7 @@ class ExistingVendorTests(unittest.TestCase):
             ["Xe-cores", "20"],
             ["Graphics Clock", "2670 MHz"],
             ["Total Board Power (TBP)", "190 W"],
+            ["Recommended PSU", "600 W"],
             ["Memory", "12 GB GDDR6"],
             ["Graphics Memory Interface", "192 bit"],
         ])], "https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html")
@@ -242,6 +245,57 @@ class ExistingVendorTests(unittest.TestCase):
         self.assertEqual(saved[0]["compute_unit_type"], "Xe-Cores")
         self.assertEqual(saved[0]["base_clock_mhz"], 2670)
         self.assertEqual(saved[0]["tdp_w"], 190)
+        self.assertEqual(saved[0]["recommended_psu_w"], 600)
+
+    def test_amd_upper_bounds_and_ambiguous_specs(self):
+        item = copy.deepcopy(AMD_SAMPLE["items"][4])
+        fields = item["elements"]
+        fields["name"]["formatValue"] = "AMD Radeon RX 9060 XT LP"
+        fields.update(typicalBoardPowerDesktop={"formatValue": "Up to 140W"},
+                      boostFrequency={"formatValue": "Up to 3", "suffix": " GHz"},
+                      memoryBandwidth={"formatValue": "Up to 320 GB/s"})
+        rows, skipped = collector.parse_amd_payload({"items": [item]})
+        self.assertFalse(skipped)
+        self.assertEqual((rows[0]["tdp_w"], rows[0]["boost_clock_mhz"], rows[0]["bandwidth_gbps"]),
+                         (140, 3000, 320))
+        self.assertIsNone(rows[0]["recommended_psu_w"])
+        self.assertIsNone(collector.parse_watts("Up to 60-80 W"))
+        self.assertIsNone(collector.parse_clock_mhz("2400-2600 MHz"))
+        self.assertEqual(collector.parse_clock_mhz("Up to 2,400 MHz"), 2400)
+        self.assertEqual(collector.parse_bandwidth_gbps("1,024.5 GB/s"), 1024.5)
+        self.assertIsNone(collector.parse_int_spec("8,16"))
+        self.assertIsNone(collector.parse_bandwidth_gbps("320 Gb/s"))
+
+    def test_intel_psu_labels_do_not_supply_board_power(self):
+        for label in ("Minimum System Power", "Required System Power"):
+            with self.subTest(label=label):
+                rows = collector.parse_intel([table([
+                    ["Vertical Segment", "Desktop"], ["Model Number", "B580"],
+                    ["Memory", "12 GB GDDR6"], ["Graphics Memory Interface", "192 bit"],
+                    [label, "600 W"],
+                ])], "https://www.intel.com/products/sku/241598/specifications.html")
+                self.assertEqual(rows[0]["recommended_psu_w"], 600)
+                self.assertIsNone(rows[0]["tdp_w"])
+
+
+class BrowserLaunchTests(unittest.TestCase):
+    def test_launch_modes_and_cleanup(self):
+        for brand in ("amd", "intel", "nvidia"):
+            for headless in (True, False):
+                with self.subTest(brand=brand, headless=headless):
+                    playwright = Mock()
+                    launch = playwright.chromium.launch
+                    with self.assertRaisesRegex(ValueError, "bad data"):
+                        with collector.collector_page(playwright, brand, headless) as page:
+                            self.assertIs(page, launch.return_value.new_page.return_value)
+                            raise ValueError("bad data")
+                    background_amd = brand == "amd" and headless
+                    options = launch.call_args.kwargs
+                    self.assertEqual(options["headless"], headless and brand != "amd")
+                    self.assertIn("--disable-http2", options["args"])
+                    self.assertEqual("--window-position=-2400,-2400" in options["args"], background_amd)
+                    self.assertEqual("--window-size=1280,800" in options["args"], background_amd)
+                    launch.return_value.close.assert_called_once_with()
 
 
 class BrowserError(Exception):

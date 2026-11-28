@@ -68,9 +68,13 @@ def synchronize(args):
                 )
                 records += len(rows)
                 info = report.get(brand, {})
-                if info.get("errors"):
-                    errors.append(f"{label} 部分采集失败：{info['errors'][0]}")
-                elif info.get("cached"):
+                issues = info.get("errors") or []
+                if info.get("status") == "partial" and (rows or info.get("cached")):
+                    notices.append(f"{label} 部分完成，{len(issues)} 项异常" +
+                                   (f"：{issues[0]}" if issues else ""))
+                elif issues or info.get("status") in ("failed", "partial"):
+                    errors.append(f"{label} 采集失败：" + (issues[0] if issues else "没有有效记录"))
+                if info.get("cached"):
                     notices.append(f"{label} 已有 {info['cached']} 条")
         except Exception as exc:
             message = error_message(exc)

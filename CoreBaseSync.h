@@ -38,6 +38,7 @@ inline std::vector<fs::path> PythonPaths(const fs::path& root) {
     if (!windows.empty()) add(fs::path(windows) / L"py.exe");
     add(L"G:\\Python\\python.exe");
     add(L"I:\\python\\python.exe");
+    add(L"I:\\Pyhton\\python.exe");
     return paths;
 }
 // Each child joins the job before its first instruction. Closing the window

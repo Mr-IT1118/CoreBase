@@ -24,7 +24,8 @@ from decimal import Decimal
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import database
-from collector import AMD_DATA_JS, AMD_DATA_SELECTOR, amd_expected_total, amd_field_values, clean, navigate
+from collector import (AMD_DATA_JS, AMD_DATA_SELECTOR, amd_expected_total, amd_field_values,
+                       amd_technology_architecture, clean, collector_page, navigate)
 
 LOG = logging.getLogger("corebase.cpu")
 AMD_URL = "https://www.amd.com/en/products/specifications/processors.html"
@@ -147,7 +148,8 @@ def amd_record(item):
         graphics = None
     return cpu_record(
         "AMD", names[0], form, link or AMD_URL,
-        series=value("series"), architecture=value("architecture") or value("cpuCoreArchitecture"),
+        series=value("series"), architecture=(value("architecture") or value("cpuCoreArchitecture")
+                                              or amd_technology_architecture(elements)),
         cores=quantity(value("numOfCpuCores"), integer=True),
         threads=quantity(value("numOfThreads"), integer=True),
         base_clock_ghz=quantity(value("baseClock"), "GHz"),
@@ -347,12 +349,13 @@ def intel_batches(page, refresh=False, limit=None):
             break
 
 
-def source_batches(page, brand, refresh, limit):
+def source_batches(playwright, brand, headless, refresh, limit):
     try:
-        if brand == "amd":
-            yield collect_amd(page)
-        else:
-            yield from intel_batches(page, refresh=refresh, limit=limit)
+        with collector_page(playwright, brand, headless) as page:
+            if brand == "amd":
+                yield collect_amd(page)
+            else:
+                yield from intel_batches(page, refresh=refresh, limit=limit)
     except Exception as exc:
         yield Batch(errors=[f"{brand}: {exc}"])
 
@@ -374,35 +377,26 @@ def collect_cpus(brands=None, headless=True, *, save=False, refresh_intel=False,
 
     result = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--disable-http2"])
-        try:
-            context = browser.new_context(locale="en-US")
-            for brand in selected:
-                started = database.utc_now()
-                errors, count, cached = [], 0, 0
-                page = context.new_page()
-                try:
-                    for batch in source_batches(page, brand, refresh_intel, limit_intel):
-                        cached += batch.cached
-                        errors.extend(batch.errors)
-                        if save and batch.rows:
-                            database.save_cpus(batch.rows, brand=brand, started_at=started,
-                                               skipped=len(batch.errors), error_message="\n".join(batch.errors) or None)
-                        elif save and batch.errors:
-                            database.record_sync_failure("CPU", brand, "\n".join(batch.errors), started, len(batch.errors))
-                        result.extend(batch.rows)
-                        count += len(batch.rows)
-                    if save and not count and not errors:
-                        database.save_cpus([], brand=brand, started_at=started)
-                finally:
-                    page.close()
-                status = ("partial" if count or cached else "failed") if errors else "success"
-                report[brand] = dict(status=status, records=count, cached=cached, errors=errors)
-                LOG.info("%s: %s, %d collected, %d already stored, %d errors", brand, status, count, cached, len(errors))
-                for error in errors:
-                    LOG.warning("%s", error)
-        finally:
-            browser.close()
+        for brand in selected:
+            started = database.utc_now()
+            errors, count, cached = [], 0, 0
+            for batch in source_batches(p, brand, headless, refresh_intel, limit_intel):
+                cached += batch.cached
+                errors.extend(batch.errors)
+                if save and batch.rows:
+                    database.save_cpus(batch.rows, brand=brand, started_at=started,
+                                       skipped=len(batch.errors), error_message="\n".join(batch.errors) or None)
+                elif save and batch.errors:
+                    database.record_sync_failure("CPU", brand, "\n".join(batch.errors), started, len(batch.errors))
+                result.extend(batch.rows)
+                count += len(batch.rows)
+            if save and not count and not errors:
+                database.save_cpus([], brand=brand, started_at=started)
+            status = ("partial" if count or cached else "failed") if errors else "success"
+            report[brand] = dict(status=status, records=count, cached=cached, errors=errors)
+            LOG.info("%s: %s, %d collected, %d already stored, %d errors", brand, status, count, cached, len(errors))
+            for error in errors:
+                LOG.warning("%s", error)
     if all(report[brand]["status"] == "failed" for brand in selected):
         raise RuntimeError("CPU collection failed: " + " | ".join(report[brand]["errors"][0] for brand in selected))
     return result

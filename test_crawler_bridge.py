@@ -2,11 +2,12 @@
 import io
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import crawler_bridge as bridge
 import database
@@ -53,6 +54,52 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(status["records"], 0)
         collect.assert_called_once_with(["intel"], headless=False, refresh_intel=True, limit_intel=3, report={})
+
+    def test_amd_background_sync_parses_and_commits_both_snapshots(self):
+        def product(**fields):
+            return {"elements": {k: {"formatValue": v} for k, v in fields.items()}}
+
+        api = MagicMock()
+        launch = api.sync_playwright.return_value.__enter__.return_value.chromium.launch
+        page = launch.return_value.new_page.return_value
+        page.evaluate.side_effect = [
+            {"summary": "", "payload": {"items": [product(name="RX 9060 XT LP", boardType="Desktop",
+                maxMemorySize="16 GB", memoryType="GDDR6", memoryInterface="128-bit",
+                typicalBoardPowerDesktop="Up to 140W")]}},
+            {"summary": "", "payload": {"items": [
+                product(name="Ryzen sample", formFactor="Desktops", numOfCpuCores=4,
+                        supportedTechnologies=["AMD Zen 3 Core Architecture"]),
+                product(name="FX-8800P", numOfCpuCores=4)]}},
+        ]
+        with patch.dict(sys.modules, {"playwright.sync_api": api}), \
+             patch.object(bridge.collector, "__file__", str(self.root / "collector.py")), \
+             patch.object(bridge.collector, "navigate"), patch.object(bridge.cpu_collector, "navigate"):
+            code, status = self.invoke("--brand", "amd")
+        self.assertEqual((code, status["records"]), (0, 2))
+        self.assertIn("部分完成", status["message"])
+        self.assertEqual(launch.call_count, 2)
+        for call in launch.call_args_list:
+            self.assertFalse(call.kwargs["headless"])
+            self.assertIn("--window-position=-2400,-2400", call.kwargs["args"])
+        with closing(sqlite3.connect(database.DB_PATH.as_uri() + "?immutable=1", uri=True)) as db:
+            self.assertEqual(db.execute("SELECT tdp_w FROM gpus").fetchall(), [(140,)])
+            self.assertEqual(db.execute("SELECT architecture FROM cpus").fetchall(), [("AMD Zen 3 Core",)])
+            self.assertEqual(db.execute("SELECT status FROM sync_logs WHERE category='CPU'").fetchone(),
+                             ("partial",))
+
+    def test_partial_with_cached_rows_and_total_failure(self):
+        for state, cached, expected in [("partial", 3, 0), ("failed", 0, 1), ("partial", 0, 1)]:
+            def collect(brands, *, report, **options):
+                report["intel"] = dict(status=state, cached=cached, errors=["detail unavailable"])
+                return []
+
+            with self.subTest(state=state, cached=cached), \
+                 patch.object(bridge.cpu_collector, "collect_and_save_cpus", collect):
+                code, status = self.invoke("--category", "cpu", "--brand", "intel")
+                self.assertEqual(code, expected)
+                self.assertIn("detail unavailable", status["message"])
+                if cached:
+                    self.assertIn("已有 3 条", status["message"])
 
     def test_missing_playwright_and_network_failure(self):
         for error, expected in [(ModuleNotFoundError("No module named 'playwright'"), "pip install playwright"),

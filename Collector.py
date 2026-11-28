@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from html import unescape
@@ -57,6 +58,7 @@ COMPUTE_UNIT_TYPES = {
     "intel": "Xe-Cores",
 }
 _MISSING_TEXT = {"", "-", "--", "n/a", "na", "none", "tbd", "varies by manufacturer"}
+_WHOLE_NUMBER = r"(?:\d+|\d{1,3}(?:,\d{3})+)"
 
 
 def _clean_optional(value):
@@ -70,10 +72,9 @@ def parse_int_spec(value, *, min_val=1, max_val=1000000):
     text = _clean_optional(value)
     if not text:
         return None
-    match = re.fullmatch(r"(\d[\d,]*)", text)
-    if not match:
+    if not re.fullmatch(_WHOLE_NUMBER, text):
         return None
-    num = int(match.group(1).replace(",", ""))
+    num = int(text.replace(",", ""))
     return num if min_val <= num <= max_val else None
 
 
@@ -81,7 +82,7 @@ def parse_watts(value):
     text = _clean_optional(value)
     if not text:
         return None
-    match = re.fullmatch(r"(\d[\d,]*)\s*W?", text, re.I)
+    match = re.fullmatch(rf"(?:up to )?({_WHOLE_NUMBER})\s*W?", text, re.I)
     if not match:
         return None
     watts = int(match.group(1).replace(",", ""))
@@ -92,12 +93,12 @@ def parse_clock_mhz(value, default_unit="MHz"):
     text = _clean_optional(value)
     if not text:
         return None
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(GHz|MHz)?", text, re.I)
+    match = re.fullmatch(rf"(?:up to )?({_WHOLE_NUMBER}(?:\.\d+)?)\s*(GHz|MHz)?", text, re.I)
     if not match:
         return None
     unit = (match.group(2) or default_unit).upper()
     try:
-        mhz = Decimal(match.group(1)) * (1000 if unit == "GHZ" else 1)
+        mhz = Decimal(match.group(1).replace(",", "")) * (1000 if unit == "GHZ" else 1)
     except InvalidOperation:
         return None
     val = int(round(mhz))
@@ -108,10 +109,10 @@ def parse_bandwidth_gbps(value):
     text = _clean_optional(value)
     if not text:
         return None
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:GB/(?:s|sec)|GBps)", text, re.I)
+    match = re.fullmatch(rf"(?i:up to )?({_WHOLE_NUMBER}(?:\.\d+)?)\s*GB(?:/s(?:ec)?|ps)", text)
     if not match:
         return None
-    val = float(match.group(1))
+    val = float(match.group(1).replace(",", ""))
     return val if 0 < val <= 100000 else None
 
 
@@ -353,16 +354,20 @@ def _amd_single(fields, key):
     return vals[0] if len(vals) == 1 else None
 
 
+def amd_technology_architecture(fields):
+    if "supportedTechnologies" not in fields:
+        return None
+    techs = amd_field_values(fields["supportedTechnologies"])
+    arch_hits = {re.sub(r"\s+Architecture$", "", t, flags=re.I) for t in techs
+                 if re.search(r"\s+Architecture$", t, re.I)}
+    return arch_hits.pop() if len(arch_hits) == 1 else None
+
+
 def _amd_architecture(fields):
     explicit = _clean_optional(_amd_single(fields, "architecture"))
     if explicit:
         return re.sub(r"\s+Architecture$", "", explicit, flags=re.I)
-    if "supportedTechnologies" not in fields:
-        return None
-    techs = amd_field_values(fields["supportedTechnologies"])
-    arch_hits = [re.sub(r"\s+Architecture$", "", t, flags=re.I) for t in techs
-                 if re.search(r"\bArchitecture$", t, re.I)]
-    return arch_hits[0] if len(arch_hits) == 1 else None
+    return amd_technology_architecture(fields)
 
 
 def _amd_specs(fields):
@@ -454,13 +459,30 @@ def parse_intel(tables, source_url):
             get("graphics max dynamic frequency", "max dynamic frequency", "boost clock")
         ),
         "bandwidth_gbps": parse_bandwidth_gbps(get("graphics memory bandwidth", "memory bandwidth")),
-        "tdp_w": parse_watts(get("total board power (tbp)", "total board power", "tdp")),
+        "tdp_w": parse_watts(get("tbp", "total board power (tbp)", "total board power", "tdp")),
+        "recommended_psu_w": parse_watts(get("minimum power supply unit", "recommended psu",
+                                             "minimum system power", "required system power")),
         "pcie_interface": _clean_optional(get("pci express configurations", "pci express revision")),
         "release_year": parse_year(get("launch date")),
     }
     return records("intel", f"Intel Arc {model}", memory,
                    get("graphics memory interface") or "", source_url,
                    identity="sku-" + sku.group(1), specs=specs)
+
+
+@contextmanager
+def collector_page(playwright, brand, headless):
+    # AMD serves its specifications reliably in full Chromium. Keep that window
+    # off-screen for background sync, and leave explicit --show-browser visible.
+    offscreen = headless and brand == "amd"
+    args = ["--disable-http2"]
+    if offscreen:
+        args.extend(["--window-position=-2400,-2400", "--window-size=1280,800"])
+    browser = playwright.chromium.launch(headless=headless and not offscreen, args=args)
+    try:
+        yield browser.new_page(locale="en-US")
+    finally:
+        browser.close()
 
 
 def navigate(page, url, domain):
@@ -562,36 +584,28 @@ def collect_gpus(brands=None, headless=True, *, report=None):
     from playwright.sync_api import sync_playwright
     output = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, args=["--disable-http2"])
-        try:
-            context = browser.new_context(locale="en-US")
-            for brand in selected:
-                started = datetime.now(timezone.utc).isoformat()
-                page = context.new_page()
-                print(f"[CoreBase] Collecting {brand.upper()} ...", flush=True)
-                try:
+        for brand in selected:
+            started = datetime.now(timezone.utc).isoformat()
+            print(f"[CoreBase] Collecting {brand.upper()} ...", flush=True)
+            try:
+                with collector_page(p, brand, headless) as page:
                     rows, warnings = handlers[brand](page)
-                    staged = {}
-                    for row in rows:
-                        previous = staged.get(row["product_id"], output.get(row["product_id"]))
-                        if previous is not None and previous != row:
-                            raise ValueError(f"Conflicting product ID: {row['product_id']}")
-                        staged[row["product_id"]] = row
-                    output.update(staged)
-                    report["brands"][brand] = {"status": "partial" if warnings else "ok",
-                                               "records": len({r['product_id'] for r in rows}),
-                                               "skipped": warnings}
-                    print(f"[{brand}] {len(rows)} records, {len(warnings)} skipped", flush=True)
-                    for warning in warnings:
-                        LOG.warning("[%s] %s", brand, warning)
-                except Exception as exc:
-                    report["brands"][brand] = {"status": "failed", "error": str(exc)}
-                    LOG.error("[%s] Collection failed: %s", brand, exc)
-                finally:
-                    report["brands"][brand]["started_at"] = started
-                    page.close()
-        finally:
-            browser.close()
+                staged = {}
+                for row in rows:
+                    previous = staged.get(row["product_id"], output.get(row["product_id"]))
+                    if previous is not None and previous != row:
+                        raise ValueError(f"Conflicting product ID: {row['product_id']}")
+                    staged[row["product_id"]] = row
+                output.update(staged)
+                report["brands"][brand] = {"status": "partial" if warnings else "ok",
+                                           "records": len(staged), "skipped": warnings}
+                print(f"[{brand}] {len(rows)} records, {len(warnings)} skipped", flush=True)
+                for warning in warnings:
+                    LOG.warning("[%s] %s", brand, warning)
+            except Exception as exc:
+                report["brands"][brand] = {"status": "failed", "error": str(exc)}
+                LOG.error("[%s] Collection failed: %s", brand, exc)
+            report["brands"][brand]["started_at"] = started
     report["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
     report["total_records"] = len(output)
     report_path = Path(__file__).resolve().parent / "collector_report.json"
